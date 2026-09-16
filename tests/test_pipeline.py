@@ -186,7 +186,7 @@ class PipelineChecks(unittest.TestCase):
             self.assertNotIn("${{", step["run"])
             self.assertNotIn("continue-on-error", step)
         self.assertEqual(discover["env"], {
-            "OPENARM_GITHUB_DISCOVERY_TOKEN": "${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN }}",
+            "OPENARM_GITHUB_DISCOVERY_TOKEN": "${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}",
             "OPENARM_GITHUB_TRIAL_CREATE": "${{ inputs.createForkPullRequest }}",
         })
         self.assertEqual(manual["env"], {

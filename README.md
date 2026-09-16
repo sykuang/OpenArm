@@ -79,7 +79,11 @@ outcomes, timestamps, inspection limits and any failure.
 Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
 variables > Actions > New repository secret**, using a token issued for
 **GitHub.com** with public read access only; no write
-permissions are needed. Without it, discovery uses anonymous public reads.
+permissions are needed. Without it, **GitHub Actions uses its existing read-only
+job token** for public discovery, avoiding reliance on the shared runner's
+anonymous quota. The token is passed only to the discovery step; release asset
+downloads remain anonymous. Local runs without this environment variable still
+use anonymous public API reads.
 It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
 Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 (GitHub search limits: 30 or 10 requests/minute respectively). Shared-IP limits
@@ -198,7 +202,8 @@ pre-create a dedicated fork and select it in the token's repository access rathe
 than granting broad access just for this test. Missing access, SSO authorization
 or enterprise fork restrictions produce a failing run, not a permission bypass.
 
-The trial job grants its built-in token only `contents: read` for checkout, does
+The trial job grants its built-in token only `contents: read` for checkout and
+public discovery, does
 not persist checkout credentials, and passes each PAT only to its own API step.
 Official checkout/upload actions are pinned to commit SHAs. The evidence upload
 step runs even after failure, fails if no files exist, and retains artifacts for

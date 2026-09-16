@@ -75,7 +75,7 @@ jobs:
         if: ${{ inputs.sourceRepositoryUrl == '' }}
         run: .\scripts\Find-Arm64Candidate.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
         env:
-          OPENARM_GITHUB_DISCOVERY_TOKEN: ${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN }}
+          OPENARM_GITHUB_DISCOVERY_TOKEN: ${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}
           OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
       - name: Run the bounded GitHub API trial
         if: ${{ inputs.sourceRepositoryUrl != '' }}
