@@ -7,8 +7,11 @@ evidence. Do not weaken tests or claim mocked/cross-built results are native.
 
 Run `.\scripts\Test-Project.ps1` before review (see README for local tool overrides).
 Add regression checks to `tests\Test-OpenArm.ps1` for behavior changes,
-`tests\Test-OutputPaths.ps1` for public output-path behavior, and
-`tests\test_pipeline.py` for YAML wiring changes. Update the associated README,
+`tests\Test-OutputPaths.ps1` for public output-path behavior,
+`tests\Test-GitHubTrial.ps1` for the offline fork/PR API contract,
+`tests\Test-RepositoryDiscovery.ps1` for the read-only popularity/issue-evidence
+contract (including incomplete results, rate limits and token separation), and
+`tests\test_pipeline.py` for Azure and GitHub Actions YAML wiring changes. Update the associated README,
 agent or skill instructions when the workflow changes. Changes to approval,
 credentials, pools or source selection require explicit human trust-boundary review.
 The approval regression checks must continue to reject unauthorized guidance,
@@ -20,6 +23,21 @@ Azure Repos needs a build-validation branch policy; a YAML `pr` trigger is not
 enforcement there. Do not authorize native pools, variable groups, service
 connections or secrets for untrusted PR builds. This repository cannot set those
 permissions or invent reviewers on your behalf.
+
+The manual `.github\workflows\github-trial.yml` discovery/fork trial replaces its
+Azure trial entry point, not the native pipeline or repository CI. Keep it
+dispatch-only, with read-only trial permissions and separately step-scoped PATs.
+Only the separate human-help job may request `issues: write` using the built-in
+token, and only in the hosting repository. Preserve the notification opt-out,
+bounded rerun deduplication and explicit failures. `tests\test_human_help.cjs`
+checks the actual inline issue script with Node.js 20+ and offline API doubles;
+the YAML tests run it automatically. Issue comments are never execution approval.
+Keep official actions pinned to reviewed commit SHAs. Only dispatch trusted
+revisions; never add a PR or issue-comment trigger to this PAT-bearing trial.
+Keep the trial on `windows-11-arm`, verify native OS/PowerShell/Node architecture,
+and verify the pinned Copilot executable's Arm64 PE type before making it
+available to later steps. CLI installation/version checks are not an AI repair
+or target-validation result; local x64 CI is not a hosted Arm64 run.
 
 ## Producing real agent-task evidence
 

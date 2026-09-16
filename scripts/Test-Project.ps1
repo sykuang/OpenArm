@@ -44,9 +44,10 @@ try {
     if (-not $IsWindows) { throw 'Repository CI requires Windows with a Visual Studio C++ toolchain.' }
     $files = @(
         Get-ChildItem -LiteralPath $PSScriptRoot, (Join-Path $root 'tests'), (Join-Path $root 'samples\arm64-smoke') -Recurse -File |
-            Where-Object Extension -in '.ps1', '.py', '.cpp', '.txt'
+            Where-Object Extension -in '.ps1', '.py', '.cjs', '.cpp', '.txt'
         Get-Item -LiteralPath (Join-Path $root 'azure-pipelines.yml'), (Join-Path $root 'azure-pipelines-ci.yml'),
-            (Join-Path $root 'native-stage.yml'), (Join-Path $root 'requirements-dev.txt'), (Join-Path $root 'targets\smoke.json')
+            (Join-Path $root '.github\workflows\github-trial.yml'), (Join-Path $root 'native-stage.yml'),
+            (Join-Path $root 'requirements-dev.txt'), (Join-Path $root 'targets\smoke.json')
     )
     $report.sourceFiles = @($files | Sort-Object FullName -Unique | ForEach-Object {
         @{ path = [IO.Path]::GetRelativePath($root, $_.FullName)
@@ -54,6 +55,8 @@ try {
     })
     Invoke-Check 'powershell' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-OpenArm.ps1'))
     Invoke-Check 'output-paths' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-OutputPaths.ps1'))
+    Invoke-Check 'github-trial' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-GitHubTrial.ps1'))
+    Invoke-Check 'repository-discovery' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-RepositoryDiscovery.ps1'))
 
     $localPython = Join-Path $root '.local\python'
     $env:PYTHONPATH = $localPython

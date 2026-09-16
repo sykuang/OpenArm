@@ -1,11 +1,18 @@
-# OpenArm Azure DevOps flow
+# OpenArm
 
-A queue-only Azure Pipelines prototype for agent-generated Windows Arm64 porting.
+Use the manual GitHub Actions workflow to discover popular repositories with
+reported Windows Arm64 work or create a documentation-only draft PR inside your
+fork. This API-only trial uses GitHub's hosted Windows Arm64 runner and installs
+native Copilot CLI; it needs no Azure DevOps setup or self-hosted worker.
+
+The separate native-porting prototype still uses queue-only Azure Pipelines.
 It includes a small runnable C++ application, actual native validation, bounded
 Copilot CLI remediation, an Azure Boards volunteer gate, optional Teams delivery,
 and human-reviewed contribution **drafts**. The separate repository CI entry point
 runs offline checks and an x64 sample, without native workers or external actions.
-Neither pipeline runs in Azure until you publish the repository and configure it.
+Those native/CI pipelines run in Azure only after you publish the repository and
+configure them; the GitHub Actions trial does not replace their native validation
+or Azure Boards/Teams approval flow.
 
 ```mermaid
 flowchart TD
@@ -26,7 +33,199 @@ flowchart TD
     K --> L[PR draft artifact: never submit or merge automatically]
 ```
 
-## Run the pipeline
+## Discover popular repositories with reported Windows Arm64 work
+
+Publish `.github\workflows\github-trial.yml` and the referenced scripts to your
+OpenArm repository's **default branch**. Enable GitHub Actions if repository policy
+permits, then open **Actions > GitHub discovery and fork trial > Run workflow**.
+Select only a trusted branch/revision: it will run with any configured trial
+secret. The workflow has no push/PR trigger. Its trial job uses the hosted
+**`windows-11-arm`** runner and verifies that both the OS and PowerShell process
+are Arm64. No self-hosted Arm64 worker, Azure Boards or Teams setup is needed.
+The independent issue-notification job remains on `windows-latest` (x64), since
+it only calls the GitHub Issues API.
+The old Azure trial pipeline file has been replaced, not retained as a second
+entry point. The native Azure pipeline and repository CI are unchanged.
+
+Before discovery or the fork trial, a pinned setup action selects **Node.js 24
+Arm64**, then installs **`@github/copilot@1.0.85`**. The workflow resolves the
+package's native Windows Arm64 executable, verifies PE machine **`0xAA64`**, runs
+`--version`, records its SHA-256 in the job log, and adds its directory to PATH.
+Any setup/architecture/version failure stops the trial and can trigger the
+human-help issue job. See the [official runner image](https://github.com/actions/runner-images/blob/main/images/windows/Windows11-Arm64-Readme.md)
+and [Copilot CLI installation documentation](https://github.com/github/copilot-cli#installation).
+
+**Installing the CLI does not invoke AI.** This workflow does not send a prompt,
+request Copilot permissions, consume Copilot requests or claim to repair a
+target. Actual AI repair still needs an explicit task, Copilot entitlement and a
+reviewed target/build-validation path. Selecting an Arm64 runner and checking the
+CLI are not proof of the target application's native compatibility.
+
+Run with **`sourceRepositoryUrl` blank** and **`createForkPullRequest` unchecked**.
+**`createHumanHelpIssue` is checked by default**: the workflow creates an issue
+in the OpenArm repository when discovery needs review or a run fails. Uncheck it
+for a strictly read-only discovery run; the discovery script itself remains
+GET-only and never writes to a target repository.
+The default path automatically lists the **top 20 public, non-archived, non-fork
+GitHub.com repositories by stars**, checks each for open Windows Arm64 issues,
+and recommends the highest-star repository with an explicit support request or
+failure report in an inspected issue title. Download the
+`github-trial-<run-id>-<attempt>` artifact from the workflow run:
+**`discovery.md`** contains the ranking and issue links; **`discovery.json`**
+contains structured assessments, request outcomes, timestamps and any failure.
+
+Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
+variables > Actions > New repository secret**, using a token issued for
+**GitHub.com** with public read access only; no write
+permissions are needed. Without it, discovery uses anonymous public reads.
+It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
+Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
+(GitHub search limits: 30 or 10 requests/minute respectively). Shared-IP limits
+can still apply. HTTP errors, rate limits and incomplete responses fail visibly,
+retain partial reports and make **no recommendation**; requests are not retried.
+
+The bounded scan makes 21 GET requests: one star-ranked repository search and
+one search per repository, `repo:OWNER/REPO is:issue is:open Windows ARM64
+in:title,body`, inspecting up to five most recently updated matches each.
+The repository query uses `stars:>=100000 is:public archived:false fork:false`
+to avoid overly broad search timeouts. It requires at least 20 and at most 4,000
+qualifying repositories and exactly 20 correctly ranked results; otherwise it
+fails instead of claiming a complete top 20. This threshold cannot exclude a
+higher-star repository when those conditions hold. Ties keep GitHub's order.
+No language filter is applied, so popular documentation/list repositories remain
+in the ranking. GitHub search is indexed, not a consistent global snapshot.
+
+Assessments are `reported_arm64_work`, `needs_review` or
+`no_matching_open_issue` (plus `not_assessed`/`error` on interrupted scans).
+Matching totals and the five-title limit are explicit. **A recommendation is
+provisional, not proof that the repository lacks Arm64 support.** Existing support
+can have open bugs. Missing matches or documentation prove nothing; aliases,
+non-English reports, closed issues and older matches may be missed. A complete
+scan may honestly find no candidate. Review the linked report and reproduce it
+on native Windows Arm64 before choosing build commands or writing a port.
+
+Discovery never clones or executes target code, forks a repository, creates a PR
+or generates an unreviewed native target configuration. A blank URL with
+`createForkPullRequest: true` is rejected. To try a reviewed candidate, copy its
+repository URL into a **separate manual run** below; the documentation-only trial
+is not an Arm64 implementation.
+
+Local read-only equivalent: `.\scripts\Find-Arm64Candidate.ps1`.
+Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are needed;
+`-Output` selects a new report directory and optional `-OutputRoot` bounds it.
+The default output is a unique `out\discovery-*` directory.
+REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
+Actions reference: [running a manual workflow](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+## Try GitHub repository checks, a fork, and a draft PR
+
+Use the same Actions workflow with a **nonblank** `sourceRepositoryUrl` for the temporary
+integration trial; this path does not run discovery.
+
+1. Add **`OPENARM_GITHUB_TOKEN`** as an **Actions repository secret** in OpenArm.
+   Use a personal access token issued by the same GitHub host as the source
+   project, not the workflow's built-in `GITHUB_TOKEN`: that token is scoped to
+   the workflow repository, not a personal account for creating forks.
+   Never put the token in YAML, a repository URL, a workflow input or chat.
+2. Run with `sourceRepositoryUrl` set to the original project you want to copy,
+   such as `https://github.com/OWNER/PROJECT`. This is not necessarily OpenArm:
+   OpenArm supplies the workflow; the selected project is its target. Supported
+   hosts are `github.com` and `msft.ghe.com`; forks stay on the same host.
+   `forkOwner` is optional: blank uses the token owner, or specify an organization
+   where your account is allowed to create forks. Managed-user/enterprise policy
+   may require an organization. The destination must differ from the source.
+3. Initially leave **`createForkPullRequest: false`**. This checks authentication,
+   source identity/default-branch commit, and any existing destination fork using
+   GET requests only. Inspect `result.json` in the artifact; this is an access check,
+   not a build, compatibility scan, or guarantee of all write permissions.
+4. To perform the live trial, use **Run workflow** again with
+   **`createForkPullRequest` checked**.
+   It creates or reuses a matching fork, waits for its git objects, creates
+   `openarm-trial-<repository-id>-<run-id>`, adds one documentation-only file under
+   `openarm-trials`, and opens a **draft PR with both head and base in that fork**.
+   The PR URL, commit, request outcomes and failures are saved in the artifact.
+
+For a pre-existing destination fork, a fine-grained token needs **Contents: read
+and write**, **Pull requests: read and write**, and **Actions: read**, plus source
+read access. Scope it to the needed repositories; metadata access is implicit.
+Creating a new fork also requires the host to permit forking into the destination,
+and the token must be able to access the resulting repository. For least privilege,
+pre-create a dedicated fork and select it in the token's repository access rather
+than granting broad access just for this test. Missing access, SSO authorization
+or enterprise fork restrictions produce a failing run, not a permission bypass.
+
+The trial job grants its built-in token only `contents: read` for checkout, does
+not persist checkout credentials, and passes each PAT only to its own API step.
+Official checkout/upload actions are pinned to commit SHAs. The evidence upload
+step runs even after failure, fails if no files exist, and retains artifacts for
+7 days. Each rerun attempt has its own artifact name without replacing earlier
+evidence. This workflow targets GitHub.com/GitHub Enterprise Cloud; its artifact
+action is not compatible with GitHub Enterprise Server.
+The separate human-help job uses its own built-in token with only `issues: write`,
+without checkout or either PAT.
+
+The trial uses GitHub REST APIs; the Actions job does **not** clone or execute the
+target's code. Use a dedicated test fork with no secrets or external automation.
+Before branch/commit/PR writes, the script checks that the destination has no
+active GitHub Actions workflows; incomplete inventory or an unknown state is an
+error. It does not disable workflows, alter permissions or audit third-party
+webhooks/integrations. Fork initialization is polled for up to 30 observations;
+mutating API calls are never automatically retried after ambiguous failures.
+
+An existing same-name repository must belong to the expected fork network.
+Existing trial branches are not overwritten. **Re-run jobs** keeps the same trial
+ID and refuses an existing branch instead of creating another PR; a new manual
+workflow dispatch gets a new trial ID. The fork's default branch is never synced,
+reset, force-pushed or directly edited. There is no upstream PR, merge or automatic
+cleanup. Close the test PR or remove its branch/fork manually when finished.
+This trial is **not a native porting patch or agent-benchmark result**.
+
+`tests\Test-GitHubTrial.ps1` exercises this flow with offline REST doubles and
+synthetic credentials; `tests\Test-RepositoryDiscovery.ps1` covers read-only
+discovery, ranking, evidence limits, partial failures and token separation.
+Repository CI never uses real GitHub tokens or performs live discovery.
+REST references: [forks](https://docs.github.com/en/rest/repos/forks),
+[contents](https://docs.github.com/en/rest/repos/contents),
+[pull requests](https://docs.github.com/en/rest/pulls/pulls), and
+[data-resident API hosts](https://docs.github.com/en/enterprise-cloud@latest/rest/using-the-rest-api/getting-started-with-the-rest-api).
+
+## Human help through GitHub issues
+
+With **`createHumanHelpIssue: true`** (the default), the Actions workflow creates
+an issue in **the repository hosting OpenArm**, currently
+`https://github.com/sykuang/OpenArm`, when the trial job fails or discovery finishes
+and a person must review/select a target. A successful manual access check or
+fork/PR trial does not need an issue. Canceled/skipped runs do not create one.
+This notification never posts an issue to a discovered target or its upstream.
+
+The issue explains the kind of help needed and links to the workflow run,
+including logs and per-attempt artifacts. It does not copy raw logs, tokens or
+untrusted target content into the issue. The failed trial stays failed even if
+notification succeeds. A successful discovery still needs human review: open
+issue evidence is not a reproduced native Windows Arm64 failure.
+
+No extra PAT is needed. Enable **Issues** on the OpenArm repository and permit
+the workflow's built-in `GITHUB_TOKEN` to use `issues: write` in the reporting job.
+Permission/API failures or disabled Issues make that job fail explicitly; the
+trial job's evidence is independent. `createHumanHelpIssue: false` disables the
+reporting job and is the opt-out for workflows that must perform no issue writes.
+
+Reruns serialize reporting and reuse the same bot-authored issue using a hidden
+run-ID marker, including closed issues; they do not overwrite the body, reopen it
+or add duplicate comments. Keep the marker when editing the issue. A new manual
+run can create a new issue. Lookup reads at most 1,000 bot-authored issues across
+all states; if the inventory exceeds that bound, reporting fails rather than
+risking a duplicate. Requests are not automatically retried. After an ambiguous
+creation error, inspect existing issues before retrying.
+
+**Comments and issue closure never execute instructions or resume work.** Review
+the evidence, resolve access/configuration or select a reviewed target, then
+start a new manual workflow run. This is notification for the GitHub trial, not
+a replacement for the separate native Azure pipeline's approved-snapshot gates.
+`tests\test_human_help.cjs`, run by `tests\test_pipeline.py`, exercises the actual
+inline workflow script using an offline GitHub API double.
+
+## Run the native pipeline
 
 1. Put this workspace in a Git repository and create an Azure DevOps **YAML**
    pipeline pointing at `azure-pipelines.yml`.
@@ -306,7 +505,8 @@ policy bypass for ordinary contributors. For GitHub, require the actual reported
 CI status and a reviewer through branch protection/rulesets. These controls need
 repository-admin setup; adding YAML does not establish enforcement.
 
-Run the same command locally with Windows, PowerShell 7.2+, Python 3.12, and Visual
+Run the same command locally with Windows, PowerShell 7.2+, Python 3.12, Node.js 20+
+(for the offline Actions issue checks), and Visual
 Studio C++/Windows SDK installed:
 
 ```powershell

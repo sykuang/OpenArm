@@ -1,0 +1,178 @@
+name: GitHub discovery and fork trial
+
+'on':
+  workflow_dispatch:
+    inputs:
+      sourceRepositoryUrl:
+        description: Source project URL (blank discovers top 20 popular repositories)
+        type: string
+        required: false
+        default: ''
+      forkOwner:
+        description: Destination organization (blank uses the token owner)
+        type: string
+        required: false
+        default: ''
+      createForkPullRequest:
+        description: Create a documentation branch and draft PR inside the fork
+        type: boolean
+        required: false
+        default: false
+      createHumanHelpIssue:
+        description: Create an issue in OpenArm when review or human help is needed
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  trial:
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out trusted OpenArm source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify native Windows Arm64 execution
+        run: |
+          $runtime = @{
+            isWindows = $IsWindows
+            osArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            processArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          }
+          $runtime | ConvertTo-Json -Compress
+          if (-not $runtime.isWindows -or $runtime.osArchitecture -ne 'Arm64' -or $runtime.processArchitecture -ne 'Arm64') {
+            throw 'This trial requires native Windows Arm64 and an Arm64 PowerShell process.'
+          }
+      - name: Set up native Arm64 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          architecture: arm64
+      - name: Install and verify native Copilot CLI
+        run: |
+          node --eval "if (process.platform !== 'win32' || process.arch !== 'arm64') throw new Error('Native Windows Arm64 Node.js is required'); console.log(process.version, process.arch)"
+          if ($LASTEXITCODE -ne 0) { throw 'Node.js architecture check failed.' }
+          npm install --global @github/copilot@1.0.85 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI installation failed.' }
+          $npmRoot = npm root --global
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the global npm installation.' }
+          $copilotExe = node --eval "process.stdout.write(require.resolve('@github/copilot-win32-arm64', { paths: [process.argv[1]] }))" "$npmRoot\@github\copilot"
+          if ($LASTEXITCODE -ne 0) { throw 'The native Windows Arm64 Copilot package is missing.' }
+          . .\scripts\Common.ps1
+          if ((Get-PeMachine $copilotExe) -ne 0xAA64) { throw 'Copilot CLI is not a native Arm64 executable.' }
+          & $copilotExe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
+          Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
+          Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
+      - name: Discover top 20 repositories and reported Windows Arm64 work
+        if: ${{ inputs.sourceRepositoryUrl == '' }}
+        run: .\scripts\Find-Arm64Candidate.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_GITHUB_DISCOVERY_TOKEN: ${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN }}
+          OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
+      - name: Run the bounded GitHub API trial
+        if: ${{ inputs.sourceRepositoryUrl != '' }}
+        run: .\scripts\Invoke-GitHubTrial.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_GITHUB_SOURCE: ${{ inputs.sourceRepositoryUrl }}
+          OPENARM_GITHUB_FORK_OWNER: ${{ inputs.forkOwner }}
+          OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
+          OPENARM_GITHUB_TRIAL_ID: ${{ github.repository_id }}-${{ github.run_id }}
+          OPENARM_GITHUB_TOKEN: ${{ secrets.OPENARM_GITHUB_TOKEN }}
+      - name: Upload trial evidence, including failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: github-trial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\github-trial
+          if-no-files-found: error
+          retention-days: 7
+
+  human-help:
+    needs: trial
+    if: ${{ always() && !cancelled() && inputs.createHumanHelpIssue && (needs.trial.result == 'failure' || (needs.trial.result == 'success' && inputs.sourceRepositoryUrl == '')) }}
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    concurrency:
+      group: openarm-human-help-${{ github.repository_id }}-${{ github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Create or reuse the run's human-help issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          OPENARM_RUN_ID: ${{ github.run_id }}
+          OPENARM_TRIAL_RESULT: ${{ needs.trial.result }}
+          OPENARM_DISCOVERY: ${{ inputs.sourceRepositoryUrl == '' }}
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const runId = process.env.OPENARM_RUN_ID;
+            const failed = process.env.OPENARM_TRIAL_RESULT === 'failure';
+            const review = process.env.OPENARM_TRIAL_RESULT === 'success' && process.env.OPENARM_DISCOVERY === 'true';
+            if (context.eventName !== 'workflow_dispatch' || !/^[1-9][0-9]*$/.test(runId) || (!failed && !review)) {
+              throw new Error('Human-help reporting is outside the allowed manual-run scope.');
+            }
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${runId}`;
+            const marker = `<!-- openarm-human-help:${runId} -->`;
+            const request = async (method, parameters) => {
+              try {
+                return await method({ ...parameters, request: { timeout: 15000 } });
+              } catch (error) {
+                const status = Number.isInteger(error.status) ? ` (HTTP ${error.status})` : '';
+                throw new Error(`Human-help issue request failed${status}. Check repository Issues, workflow permissions and existing run issues before retrying. Creation may already have completed; no request was automatically retried.`);
+              }
+            };
+            const receipt = (number, status) => {
+              if (!Number.isSafeInteger(number) || number < 1) {
+                throw new Error('GitHub returned an invalid issue number; inspect the run before retrying.');
+              }
+              const issueUrl = `${context.serverUrl}/${owner}/${repo}/issues/${number}`;
+              core.info(`Human-help issue ${status}: ${issueUrl}`);
+              return { status, issueUrl };
+            };
+            // ponytail: scan at most 1,000 bot issues; add a durable run-to-issue index if this cap is reached.
+            for (let page = 1; page <= 10; page++) {
+              const response = await request(github.rest.issues.listForRepo, {
+                owner, repo, state: 'all', creator: 'github-actions[bot]',
+                sort: 'created', direction: 'desc', per_page: 100, page,
+              });
+              if (response.status !== 200 || !Array.isArray(response.data) || response.data.length > 100) {
+                throw new Error('GitHub returned an invalid issue inventory; no issue was created.');
+              }
+              const existing = response.data.find(issue =>
+                !issue.pull_request && issue.user?.login === 'github-actions[bot]' &&
+                typeof issue.body === 'string' && issue.body.includes(marker));
+              if (existing) return receipt(existing.number, 'reused');
+              if (!response.headers.link?.includes('rel="next"')) break;
+              if (page === 10) {
+                throw new Error('Issue inventory exceeds 1,000 bot issues; cannot safely rule out an existing run issue.');
+              }
+            }
+            const reason = failed
+              ? 'The trial or evidence publication failed. A human must inspect the run logs and resolve the blocker.'
+              : 'Discovery completed. A human must review the candidate and its issue evidence, or select a target manually if no candidate was found.';
+            const body = [
+              marker, '', '## Human help needed', '', reason, '',
+              `Workflow run and all rerun attempts: ${runUrl}`, '',
+              'Download the github-trial-<run-id>-<attempt> artifact from that run when available.',
+              'Inspect discovery.md/discovery.json for candidate evidence, or result.json/failure.log for the fork trial. If no artifact was uploaded, use the job logs.',
+              '', 'This is not proof of native Windows Arm64 compatibility or failure.',
+              'This issue does not authorize code execution, a fork, a PR, or a merge. Comments and closure do not automatically resume work.',
+              'After reviewing the evidence or resolving access/configuration, start a new manual workflow run with the reviewed inputs.',
+            ].join('\n');
+            const created = await request(github.rest.issues.create, {
+              owner, repo, title: `OpenArm: human help needed (run ${runId})`, body,
+            });
+            if (created.status !== 201) throw new Error('Issue creation was not confirmed; inspect the run before retrying.');
+            return receipt(created.data.number, 'created');
