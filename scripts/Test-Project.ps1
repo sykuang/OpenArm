@@ -61,6 +61,7 @@ try {
     Invoke-Check 'repository-discovery' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-RepositoryDiscovery.ps1'))
     Invoke-Check 'release-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-ReleaseEvidence.ps1'))
     Invoke-Check 'copilot-repair' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-CopilotRepair.ps1'))
+    Invoke-Check 'launcher-gate' 'node' @('--test', (Join-Path $root 'tests\test_agent_browser_gate.cjs'))
 
     $localPython = Join-Path $root '.local\python'
     $env:PYTHONPATH = $localPython
