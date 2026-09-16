@@ -148,8 +148,13 @@ function Get-PinnedSource($Config, [string] $Commit, [string] $Destination, [str
     Copy-Source $source $Destination
 }
 
-function Get-PeMachine([string] $Path) {
-    $stream = [IO.File]::OpenRead($Path)
+function Get-PeMachine {
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Path')] [string] $Path,
+        [Parameter(Mandatory, ParameterSetName = 'Bytes')] [byte[]] $Bytes
+    )
+    $stream = if ($PSCmdlet.ParameterSetName -eq 'Bytes') { [IO.MemoryStream]::new($Bytes, $false) } else { [IO.File]::OpenRead($Path) }
     $reader = [IO.BinaryReader]::new($stream)
     try {
         if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) { throw "Not a PE file: $Path" }

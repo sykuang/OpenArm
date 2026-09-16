@@ -5,6 +5,7 @@ param(
     [string] $OutputRoot = ''
 )
 . "$PSScriptRoot\Common.ps1"
+. "$PSScriptRoot\ReleaseEvidence.ps1"
 
 $Output = Resolve-OutputPath -Path $Output -Root $OutputRoot
 if (Test-Path -LiteralPath $Output) { throw 'Discovery output already exists; choose a new directory.' }
@@ -13,11 +14,17 @@ $token = $env:OPENARM_GITHUB_DISCOVERY_TOKEN
 if ([string]::IsNullOrWhiteSpace($token) -or $token.StartsWith('$(')) { $token = '' }
 $interval = if ($token) { 3 } else { 7 }
 $report = @{
-    schemaVersion = 1; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+    schemaVersion = 2; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
     completedAt = $null; apiHost = 'api.github.com'; authMode = $(if ($token) { 'token' } else { 'anonymous' })
     repositoryQuery = 'stars:>=100000 is:public archived:false fork:false'
     sort = 'stars'; order = 'desc'; requestedCount = 20; matchingRepositoryCount = $null
-    assessedCount = 0; nativeVerified = $false; recommendation = $null; error = $null
+    assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendation = $null; error = $null
+    releaseScope = @{
+        endpoint = 'releases/latest'; maxAssetsRecordedPerRepository = 100; maxDownloadsPerRepository = 3
+        maxZipBytes = 16MB; maxTotalDownloadBytes = 128MB; maxReleasePhaseSeconds = 180
+        maxDownloadSeconds = 30; maxRedirects = 3; maxPeHeaderBytes = 65536
+        maxZipEntries = 512; maxPeEntriesPerZip = 16
+    }
     repositories = @(); requests = @()
     limitations = @(
         'Popularity means GitHub.com stars, not suitability for Windows or Arm64.'
@@ -27,6 +34,12 @@ $report = @{
         'Only explicit Windows Arm64 support requests or failure wording in those titles can yield a provisional recommendation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
+        'Release scope is the latest published non-prerelease GitHub release and up to 100 assets returned with it, not all distribution channels or older releases.'
+        'Missing releases/assets, filenames, unsupported formats and inspection limits do not prove missing Arm64 support.'
+        'Filename hints are not verified architecture. PE headers identify individual EXE/DLL machine types, not working applications, signatures, complete integrity or native runtime compatibility.'
+        'At most three assets per repository: EXE/DLL prefixes (64 KiB) or complete ZIPs (16 MiB). No archive paths are extracted; at most 512 entries and sixteen 64-KiB PE headers per ZIP.'
+        'Downloads are anonymous HTTPS to GitHub/allowlisted release CDNs, at most three redirects, 30 seconds each, 128 MiB total and a 180-second release-phase budget; limit hits remain unverified.'
+        'An x64 observation without Arm64 in the inspected sample is only a possible distribution gap; existing Arm64 binaries can coexist with real reported bugs.'
         'No source is cloned, built or executed. No fork, branch, PR, native target configuration or upstream change is created.'
     )
 }
@@ -41,7 +54,7 @@ function Save-Discovery {
     $lines = [Collections.Generic.List[string]]::new()
     $lines.Add('# Windows Arm64 repository discovery')
     $lines.Add('')
-    $lines.Add("Status: **$($report.status)**. Assessed: $($report.assessedCount)/20. Authentication: $($report.authMode).")
+    $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/20. Releases assessed: $($report.releaseAssessedCount)/20. Authentication: $($report.authMode).")
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
     $lines.Add("Repository query: ``$($report.repositoryQuery)``; stars descending; first page only.")
     if ($report.error) { $lines.Add("Error: $(ConvertTo-MarkdownText $report.error)") }
@@ -50,6 +63,7 @@ function Save-Discovery {
         $candidate = $report.recommendation
         $lines.Add("Recommendation (provisional): [$($candidate.fullName)]($($candidate.repositoryUrl)).")
         $lines.Add("Reported work: [$(ConvertTo-MarkdownText $candidate.issueTitle)]($($candidate.issueUrl)).")
+        $lines.Add("Release evidence: $($candidate.releaseEvidence). Next investigation: $($candidate.workKind).")
         $lines.Add('Review the issue and reproduce it on Windows Arm64 before selecting a build target or making changes.')
     } elseif ($report.status -eq 'completed') {
         $lines.Add('No evidence-backed candidate found within these twenty repositories and the bounded issue search.')
@@ -57,10 +71,10 @@ function Save-Discovery {
         $lines.Add('No recommendation: discovery has not completed successfully.')
     }
     $lines.Add('')
-    $lines.Add('| Rank | Repository | Stars | Language | Assessment | Open matches / inspected |')
-    $lines.Add('| --- | --- | --- | --- | --- | --- |')
+    $lines.Add('| Rank | Repository | Stars | Language | Issue assessment | Open matches / inspected | Release / Arm64 evidence |')
+    $lines.Add('| --- | --- | --- | --- | --- | --- | --- |')
     foreach ($repository in $report.repositories) {
-        $lines.Add("| $($repository.rank) | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) |")
+        $lines.Add("| $($repository.rank) | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) | $($repository.release.status) / $($repository.release.windowsArm64) |")
     }
     $lines.Add('')
     $lines.Add('## Issue evidence')
@@ -71,17 +85,27 @@ function Save-Discovery {
         if ($repository.evidenceTruncated) { $lines.Add("- $($repository.fullName): additional matching issues were not inspected.") }
     }
     $lines.Add('')
+    $lines.Add('## Release binary evidence')
+    foreach ($repository in $report.repositories) {
+        $release = $repository.release
+        if (-not $release.url) { continue }
+        $lines.Add("### $($repository.fullName): [$(ConvertTo-MarkdownText $release.tag)]($($release.url))")
+        $lines.Add("Published: $(ConvertTo-MarkdownText $release.publishedAt). Returned assets: $($release.returnedAssetCount). Metadata truncated: $($release.metadataTruncated).")
+        foreach ($asset in $release.assets) {
+            $lines.Add("- [$(ConvertTo-MarkdownText $asset.name)]($($asset.url)): $($asset.size) bytes; filename hints $($asset.platformHint)/$($asset.architectureHint); inspection $($asset.inspection); PE architectures: $($asset.architectures -join ', '); mismatch: $($asset.architectureMismatch).")
+            foreach ($binary in $asset.binaries) {
+                $lines.Add("  - $(ConvertTo-MarkdownText $binary.name): $($binary.status) $($binary.machine) $($binary.architecture).")
+            }
+            if ($asset.error) { $lines.Add("  - Error: $(ConvertTo-MarkdownText $asset.error)") }
+        }
+    }
+    $lines.Add('')
     $lines.Add('## Limits')
     foreach ($limitation in $report.limitations) { $lines.Add("- $limitation") }
     $lines | Set-Content -LiteralPath (Join-Path $Output 'discovery.md') -Encoding utf8
 }
 
-function Invoke-DiscoverySearch([string] $Kind, [string] $Query, [int] $Count) {
-    if ($Kind -notin 'repositories', 'issues') { throw 'Unexpected discovery endpoint.' }
-    if ($report.requests.Count) { Start-Sleep -Seconds $interval }
-    $sort = if ($Kind -eq 'repositories') { 'stars' } else { 'updated' }
-    $uri = "https://api.github.com/search/${Kind}?q=$([uri]::EscapeDataString($Query))&sort=$sort&order=desc&per_page=$Count&page=1"
-    $entry = @{ endpoint = $Kind; query = $Query; httpStatus = $null }
+function Invoke-DiscoveryApi([string] $Uri, [hashtable] $Entry, [switch] $AllowNotFound) {
     $report.requests += $entry
     Save-Discovery
     $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'
@@ -96,9 +120,20 @@ function Invoke-DiscoverySearch([string] $Kind, [string] $Query, [int] $Count) {
         throw 'GitHub discovery transport failed. No request was retried; check network connectivity and rerun.'
     }
     $entry.httpStatus = $status
+    if ($AllowNotFound -and $status -eq 404) { return $null }
     if ($status -ne 200) {
-        throw "GitHub discovery failed (HTTP $status). Check public GitHub access and search rate limits; rerun after resolving the error."
+        throw "GitHub discovery failed (HTTP $status). Check public GitHub access and API rate limits; rerun after resolving the error."
     }
+    if ($null -eq $response) { throw 'GitHub discovery returned an empty API response.' }
+    $response
+}
+
+function Invoke-DiscoverySearch([string] $Kind, [string] $Query, [int] $Count) {
+    if ($Kind -notin 'repositories', 'issues') { throw 'Unexpected discovery endpoint.' }
+    if ($report.requests.Count) { Start-Sleep -Seconds $interval }
+    $sort = if ($Kind -eq 'repositories') { 'stars' } else { 'updated' }
+    $uri = "https://api.github.com/search/${Kind}?q=$([uri]::EscapeDataString($Query))&sort=$sort&order=desc&per_page=$Count&page=1"
+    $response = Invoke-DiscoveryApi $uri @{ endpoint = $Kind; query = $Query; httpStatus = $null }
     if ($null -eq $response -or -not $response.PSObject.Properties['incomplete_results'] -or
         $response.incomplete_results -isnot [bool] -or
         -not $response.PSObject.Properties['total_count'] -or
@@ -156,6 +191,7 @@ try {
             url = "https://github.com/$($repository.full_name)"; stars = $repository.stargazers_count
             language = $repository.language; defaultBranch = $repository.default_branch
             assessment = 'not_assessed'; matchingIssueCount = $null; evidenceTruncated = $false; issues = @()
+            release = @{ status = 'not_assessed'; windowsArm64 = 'unknown'; url = $null }
             issueQuery = "repo:$($repository.full_name) is:issue is:open Windows ARM64 in:title,body"
         }
     }
@@ -187,6 +223,16 @@ try {
         $report.assessedCount++
         Save-Discovery
     }
+    $budget = @{ remainingBytes = 128MB; assetCount = 0; clock = [Diagnostics.Stopwatch]::StartNew() }
+    foreach ($repository in $report.repositories) {
+        $currentRepository = $repository
+        $repository.release.status = 'assessing'
+        $release = Invoke-DiscoveryApi "https://api.github.com/repos/$($repository.fullName)/releases/latest" `
+            @{ endpoint = 'latest_release'; repository = $repository.fullName; httpStatus = $null } -AllowNotFound
+        $null = Get-ReleaseEvidence $release $repository.fullName $budget -Result $repository.release
+        $report.releaseAssessedCount++
+        Save-Discovery
+    }
     $currentRepository = $null
     $candidate = $report.repositories | Where-Object assessment -eq 'reported_arm64_work' | Select-Object -First 1
     if ($candidate) {
@@ -194,11 +240,20 @@ try {
         $report.recommendation = @{
             fullName = $candidate.fullName; repositoryUrl = $candidate.url; stars = $candidate.stars
             issueUrl = $issue.url; issueTitle = $issue.title; provisional = $true
+            releaseEvidence = $candidate.release.windowsArm64
+            releaseUrl = $candidate.release.url
+            workKind = $(if ($candidate.release.artifactProblem) { 'investigate_release_artifact' }
+                elseif ($candidate.release.windowsArm64 -in 'pe_header_found', 'advertised_unverified') { 'investigate_existing_arm64_distribution' }
+                elseif ($candidate.release.windowsArm64 -eq 'x64_observed_arm64_not_found_in_sample') { 'investigate_possible_distribution_gap' }
+                else { 'investigate_reported_arm64_work' })
         }
     }
     $report.status = 'completed'
 } catch {
-    if ($currentRepository) { $currentRepository.assessment = 'error' }
+    if ($currentRepository) {
+        if ($currentRepository.release.status -ne 'not_assessed') { $currentRepository.release.status = 'error' }
+        else { $currentRepository.assessment = 'error' }
+    }
     $report.status = 'failed'
     $report.error = $_.Exception.Message
     if ($token) { $report.error = $report.error.Replace($token, '[redacted]') }

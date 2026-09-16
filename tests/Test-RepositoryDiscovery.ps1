@@ -20,6 +20,13 @@ function New-Issue([int] $RepoNumber, [string] $Title, [int] $Number = 1) {
         html_url = "https://github.com/owner/repo$RepoNumber/issues/$Number"
         repository_url = "https://api.github.com/repos/owner/repo$RepoNumber" }
 }
+function New-Release([array] $Assets = @()) {
+    @{ tag_name = 'v1'; published_at = '2026-09-16T00:00:00Z'; draft = $false; prerelease = $false; assets = $Assets }
+}
+function New-ReleaseAsset([string] $Name, [long] $Size = 256) {
+    @{ name = $Name; size = $Size; state = 'uploaded'
+        browser_download_url = "https://github.com/owner/repo2/releases/download/v1/$([uri]::EscapeDataString($Name))" }
+}
 function Reset-Mock {
     $env:OPENARM_GITHUB_DISCOVERY_TOKEN = 'public-test-placeholder'
     $global:DiscoveryMock = @{
@@ -35,11 +42,26 @@ function Reset-Mock {
             'repo2' = @(New-Issue 2 'Add Windows ARM64 support')
             'repo3' = @(New-Issue 3 'Build fails on Windows ARM64')
         }
+        releases = @{}; downloads = 0; assetMachine = 0xAA64; assetFailure = $false
         issueTotal = @{}; incompleteAt = 0; failAt = 0; failStatus = 403
         throwAt = 0; malformedAt = 0; total = 100
     }
 }
 function global:Start-Sleep { param($Seconds) $global:DiscoveryMock.sleeps.Add($Seconds) }
+function global:Mock-DiscoveryBytes {
+    param($Uri, $ExpectedSize, $PrefixOnly, $Budget)
+    $m = $global:DiscoveryMock
+    $m.downloads++
+    if ($m.assetFailure) { throw 'Release download failed (HTTP 403).' }
+    $bytes = [byte[]]::new(256)
+    [BitConverter]::GetBytes([uint16]0x5A4D).CopyTo($bytes, 0)
+    [BitConverter]::GetBytes([int]128).CopyTo($bytes, 0x3C)
+    [BitConverter]::GetBytes([uint32]0x4550).CopyTo($bytes, 128)
+    [BitConverter]::GetBytes([uint16]$m.assetMachine).CopyTo($bytes, 132)
+    $Budget.remainingBytes -= $bytes.Length
+    return ,$bytes
+}
+Set-Alias -Name Receive-ReleaseBytes -Value Mock-DiscoveryBytes -Scope Global
 function global:Invoke-RestMethod {
     param($Method, $Uri, $Headers, $TimeoutSec, $MaximumRedirection,
         [switch] $SkipHttpErrorCheck, $StatusCodeVariable, $ErrorAction)
@@ -55,6 +77,13 @@ function global:Invoke-RestMethod {
     Set-Variable -Name $StatusCodeVariable -Value $status -Scope 1
     if ($status -ne 200) { return [pscustomobject]@{ message = 'Secret public-test-placeholder' } }
     if ($call -eq $m.malformedAt) { return [pscustomobject]@{ message = 'Invalid response' } }
+    if ($url.AbsolutePath -match '^/repos/owner/(repo\d+)/releases/latest$') {
+        if ($m.releases.ContainsKey($Matches[1])) {
+            return $m.releases[$Matches[1]] | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        }
+        Set-Variable -Name $StatusCodeVariable -Value 404 -Scope 1
+        return [pscustomobject]@{ message = 'Not Found' }
+    }
     if ($url.AbsolutePath -eq '/search/repositories') {
         $items = $m.repositories
         $total = $m.total
@@ -81,7 +110,8 @@ try {
     Assert (-not $run.error) "Public discovery command succeeds: $($run.error)"
     $r = $run.report
     Assert ($r.status -eq 'completed' -and $r.repositories.Count -eq 20 -and $r.assessedCount -eq 20) 'Exactly twenty repositories are assessed'
-    Assert ($global:DiscoveryMock.calls.Count -eq 21) 'One repository search and twenty bounded issue searches only'
+    Assert ($global:DiscoveryMock.calls.Count -eq 41) 'One repository search, twenty issue searches and twenty latest-release reads only'
+    Assert ($r.releaseAssessedCount -eq 20 -and $r.repositories[0].release.status -eq 'no_published_release') 'A missing stable release stays unknown, not proof of absent Arm64 support'
     Assert ($global:DiscoveryMock.calls[0].route -eq '/search/repositories?q=stars:>=100000 is:public archived:false fork:false&sort=stars&order=desc&per_page=20&page=1') 'Ranking uses an explicit safe threshold, descending stars and only the first twenty'
     Assert (($r.repositories.fullName -join ',') -eq ((1..20 | ForEach-Object { "owner/repo$_" }) -join ',')) 'API star order and all repository identities are preserved'
     Assert ($r.repositories[0].assessment -eq 'needs_review' -and $r.repositories[3].assessment -eq 'no_matching_open_issue') 'Incidental mentions and no matches do not imply lack of support'
@@ -93,6 +123,63 @@ try {
     $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
     Assert ($markdown -like '*owner/repo20*' -and $markdown -like '*Add Windows ARM64 support*' -and $markdown -like '*provisional*') 'Readable report includes the full ranking and evidence'
     Assert ($r.startedAt -and $r.completedAt -and $r.repositoryQuery -and $r.limitations.Count -gt 0) 'Search scope, timestamps and limitations are durable'
+
+    foreach ($case in 'arm64', 'x64', 'mislabeled', 'empty', 'msi', 'no-assets') {
+        Reset-Mock
+        $name = switch ($case) {
+            'x64' { 'app-win-x64.exe' }; 'msi' { 'app-win-arm64.msi' }; default { 'app-win-arm64.exe' }
+        }
+        $size = if ($case -eq 'empty') { 0 } else { 256 }
+        $assets = @(if ($case -ne 'no-assets') { New-ReleaseAsset $name $size })
+        $global:DiscoveryMock.releases['repo2'] = New-Release $assets
+        if ($case -in 'x64', 'mislabeled') { $global:DiscoveryMock.assetMachine = 0x8664 }
+        $run = Run-Discovery "release-$case"
+        $expected = switch ($case) {
+            'x64' { 'investigate_possible_distribution_gap' }
+            { $_ -in 'empty', 'mislabeled' } { 'investigate_release_artifact' }
+            'no-assets' { 'investigate_reported_arm64_work' }
+            default { 'investigate_existing_arm64_distribution' }
+        }
+        Assert (-not $run.error -and $run.report.recommendation.fullName -eq 'owner/repo2' -and
+            $run.report.recommendation.workKind -eq $expected) "Release evidence changes the investigation, not the issue-backed star ranking: $case ($($run.error))"
+        $release = $run.report.repositories[1].release
+        Assert ($release.tag -eq 'v1' -and ([DateTimeOffset]$release.publishedAt).ToUniversalTime().ToString('o') -like '2026-09-16T00:00:00*' -and
+            $release.url -eq 'https://github.com/owner/repo2/releases/tag/v1') 'Latest-release provenance is durable'
+        if ($case -eq 'arm64') {
+            Assert ($release.windowsArm64 -eq 'pe_header_found' -and $release.assets[0].binaries[0].machine -eq '0xAA64' -and
+                $global:DiscoveryMock.downloads -eq 1) 'Public discovery inspects actual binary headers'
+            $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
+            Assert ($markdown -like '*Release binary evidence*' -and $markdown -like '*0xAA64*' -and $markdown -like '*app-win-arm64.exe*') 'Markdown exposes release and binary evidence, not just JSON'
+        }
+    }
+    foreach ($case in 'http', 'malformed', 'draft', 'prerelease', 'date', 'asset-url', 'download') {
+        Reset-Mock
+        $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app.exe')
+        switch ($case) {
+            'http' { $global:DiscoveryMock.failAt = 23 }
+            'malformed' { $global:DiscoveryMock.malformedAt = 23 }
+            'draft' { $global:DiscoveryMock.releases['repo2'].draft = $true }
+            'prerelease' { $global:DiscoveryMock.releases['repo2'].prerelease = $true }
+            'date' { $global:DiscoveryMock.releases['repo2'].published_at = 'not a date' }
+            'asset-url' { $global:DiscoveryMock.releases['repo2'].assets[0].browser_download_url = 'https://evil.invalid/app.exe' }
+            'download' { $global:DiscoveryMock.assetFailure = $true }
+        }
+        $run = Run-Discovery "release-error-$case"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $null -eq $run.report.recommendation -and
+            $run.report.assessedCount -eq 20 -and $run.report.releaseAssessedCount -eq 1 -and
+            $global:DiscoveryMock.calls.Count -eq 23) "Release failure retains issue progress but prevents a premature recommendation: $case"
+        Assert ($run.report.repositories[1].assessment -eq 'reported_arm64_work' -and
+            $run.report.repositories[1].release.status -eq 'error') 'Release errors do not erase completed issue assessments'
+        if ($case -eq 'download') {
+            Assert ($run.report.repositories[1].release.assets[0].inspection -eq 'download_error' -and
+                $run.report.repositories[1].release.assets[0].error -like '*HTTP 403*') 'Download failure retains the exact asset and sanitized error'
+        }
+    }
+    Reset-Mock
+    $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app-win-arm64-[click](evil).msi')
+    $run = Run-Discovery 'release-markdown'
+    $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
+    Assert (-not $run.error -and -not $markdown.Contains('[click](evil)') -and $markdown.Contains('%28evil%29')) 'Release filenames and URLs cannot inject Markdown links'
 
     Reset-Mock
     $global:DiscoveryMock.issues = @{}
@@ -125,7 +212,7 @@ try {
     $run = Run-Discovery 'bounded-issues'
     Assert (-not $run.error -and $run.report.repositories[1].matchingIssueCount -eq 12 -and
         $run.report.repositories[1].issues.Count -eq 5 -and $run.report.repositories[1].evidenceTruncated) 'Only five recent issue titles are inspected and truncation stays visible'
-    Assert ($global:DiscoveryMock.calls.Count -eq 21 -and $run.report.recommendation.fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
+    Assert ($global:DiscoveryMock.calls.Count -eq 41 -and $run.report.recommendation.fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
 
     foreach ($field in 'incompleteAt', 'malformedAt', 'throwAt') {
         foreach ($at in 1, 4) {
@@ -199,6 +286,8 @@ try {
     Assert (@($artifacts | Where-Object { $_ -match 'public-test-placeholder|enterprise-test-placeholder|Do not persist raw issue bodies' }).Count -eq 0) 'Artifacts exclude tokens, raw API bodies and raw transport errors'
     Write-Host "$checks repository discovery checks passed."
 } finally {
+    Remove-Item Alias:\Receive-ReleaseBytes -ErrorAction SilentlyContinue
+    Remove-Item Function:\Mock-DiscoveryBytes -ErrorAction SilentlyContinue
     Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
     Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
     Remove-Variable DiscoveryMock -Scope Global -ErrorAction SilentlyContinue

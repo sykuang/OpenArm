@@ -2,7 +2,7 @@
 
 Use the manual GitHub Actions workflow to discover popular repositories with
 reported Windows Arm64 work or create a documentation-only draft PR inside your
-fork. This API-only trial uses GitHub's hosted Windows Arm64 runner and installs
+fork. This read-only discovery/API fork trial uses GitHub's hosted Windows Arm64 runner and installs
 native Copilot CLI; it needs no Azure DevOps setup or self-hosted worker.
 
 The separate native-porting prototype still uses queue-only Azure Pipelines.
@@ -67,12 +67,14 @@ in the OpenArm repository when discovery needs review or a run fails. Uncheck it
 for a strictly read-only discovery run; the discovery script itself remains
 GET-only and never writes to a target repository.
 The default path automatically lists the **top 20 public, non-archived, non-fork
-GitHub.com repositories by stars**, checks each for open Windows Arm64 issues,
+GitHub.com repositories by stars**, checks each for open Windows Arm64 issues
+and inspects its latest stable GitHub release assets,
 and recommends the highest-star repository with an explicit support request or
 failure report in an inspected issue title. Download the
 `github-trial-<run-id>-<attempt>` artifact from the workflow run:
-**`discovery.md`** contains the ranking and issue links; **`discovery.json`**
-contains structured assessments, request outcomes, timestamps and any failure.
+**`discovery.md`** contains the ranking, issue links and release/binary evidence;
+**`discovery.json`** (schema version 2) contains structured assessments, request
+outcomes, timestamps, inspection limits and any failure.
 
 Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
 variables > Actions > New repository secret**, using a token issued for
@@ -84,9 +86,12 @@ Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 can still apply. HTTP errors, rate limits and incomplete responses fail visibly,
 retain partial reports and make **no recommendation**; requests are not retried.
 
-The bounded scan makes 21 GET requests: one star-ranked repository search and
+The bounded scan makes 41 API GET requests: one star-ranked repository search and
 one search per repository, `repo:OWNER/REPO is:issue is:open Windows ARM64
 in:title,body`, inspecting up to five most recently updated matches each.
+It then reads `/repos/OWNER/REPO/releases/latest` once per repository; a 404
+records `no_published_release`, not absent support. The core API has a separate
+anonymous limit (normally 60 requests/hour, shared by IP).
 The repository query uses `stars:>=100000 is:public archived:false fork:false`
 to avoid overly broad search timeouts. It requires at least 20 and at most 4,000
 qualifying repositories and exactly 20 correctly ranked results; otherwise it
@@ -104,6 +109,43 @@ non-English reports, closed issues and older matches may be missed. A complete
 scan may honestly find no candidate. Review the linked report and reproduce it
 on native Windows Arm64 before choosing build commands or writing a port.
 
+Release evidence records the tag, publication time, release URL and up to **100
+assets from the latest-release response** (names, URLs and sizes). Drafts,
+prereleases, older releases and distribution through npm, PyPI, vendors or other
+channels are outside this scope. Filename platform/architecture hints are
+**advertised, not verified**. Discovery downloads at most **3 assets per
+repository**, preferring Windows Arm64 names, then other Windows assets:
+
+- Direct `.exe`/`.dll`: inspect at most **64 KiB** using a range request (also
+  bounded if the server ignores the range), reading the actual PE machine field.
+- `.zip` up to **16 MiB**: inspect in memory without extracting any paths.
+  At most **512 entries** are considered and **16 EXE/DLL prefixes** are read,
+  with at most **64 KiB decompressed per prefix**. Non-Windows-labelled archives
+  are skipped; unlabelled ZIPs can reveal otherwise unadvertised PE binaries.
+- Downloads use **no credentials or cookies**, only HTTPS GitHub release URLs
+  and allowlisted GitHub release CDN hosts, with at most **3 redirects**,
+  **30 seconds per asset**, **128 MiB total** and a **180-second release-phase
+  budget**. Metadata still gets checked after the download budget expires.
+  Downloaded bytes stay in memory; only sample sizes, SHA-256 digests, PE
+  evidence and sanitized errors are retained. Download failures fail the scan
+  explicitly with partial evidence and no recommendation.
+
+`release.windowsArm64` distinguishes `pe_header_found`,
+`advertised_unverified`, `x64_observed_arm64_not_found_in_sample` and `unknown`.
+ARM64, ARM64EC and ARM64X machine types are recorded separately. Empty assets,
+invalid PE/ZIP data and filename/header mismatches are flagged; oversized
+archives, unsupported formats (including MSI/MSIX), large PE header offsets and
+budget limits remain explicitly unverified. These are header observations, not
+signature/integrity checks, proof that every component is Arm64, or a successful
+application launch. An x86 PE header may also belong to managed AnyCPU code.
+
+The recommendation still requires an inspected matching issue and preserves
+star order. Its `workKind` directs review toward an artifact problem, an
+existing advertised/observed Arm64 distribution, a possible distribution gap,
+or an unresolved issue with unknown release evidence. Existing Arm64 binaries
+do not suppress a real reported bug; x64-only observations in this bounded
+sample do not establish that an entire repository lacks Arm64 support.
+
 Discovery never clones or executes target code, forks a repository, creates a PR
 or generates an unreviewed native target configuration. A blank URL with
 `createForkPullRequest: true` is rejected. To try a reviewed candidate, copy its
@@ -115,6 +157,8 @@ Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are need
 `-Output` selects a new report directory and optional `-OutputRoot` bounds it.
 The default output is a unique `out\discovery-*` directory.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
+Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
+and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
 Actions reference: [running a manual workflow](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
 ## Try GitHub repository checks, a fork, and a draft PR

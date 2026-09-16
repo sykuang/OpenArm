@@ -57,6 +57,7 @@ try {
     Invoke-Check 'output-paths' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-OutputPaths.ps1'))
     Invoke-Check 'github-trial' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-GitHubTrial.ps1'))
     Invoke-Check 'repository-discovery' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-RepositoryDiscovery.ps1'))
+    Invoke-Check 'release-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-ReleaseEvidence.ps1'))
 
     $localPython = Join-Path $root '.local\python'
     $env:PYTHONPATH = $localPython
