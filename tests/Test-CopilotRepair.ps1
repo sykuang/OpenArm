@@ -120,6 +120,32 @@ try {
     Assert-Throws { Invoke-LoggedProcess $pwsh @() $root "$root\invalid.log" -ActionsCopilot } '*only available to agent*'
     Assert ((Read-RepairTask hermes-browser-77488).mode -eq 'diagnose') 'Hermes external package issue cannot trigger edits'
     Assert ((Read-RepairTask cmake-smoke).repository -eq 'self') 'Native self-test is not an invented external repair'
+    $wrapperTask = Read-RepairTask agent-browser-empty-launcher
+    Assert ($wrapperTask.mode -eq 'npm-wrapper' -and $wrapperTask.fork -eq '') 'Dependency launcher is a separate, nonpublishing task'
+    $wrapperCandidate = New-Candidate
+    $wrapperCandidate.taskId = $wrapperTask.id
+    $wrapperCandidate.sourceCommit = $wrapperTask.commit
+    $wrapperCandidate.files[0].path = 'bin/agent-browser.js'
+    Assert-RepairBundle $wrapperCandidate $wrapperTask '101' ('b' * 40)
+    foreach ($bad in 'scripts/postinstall.js', 'package.json', 'test/launcher.test.mjs', 'bin/other.js') {
+        $wrapperCandidate.files[0].path = $bad
+        Assert-Throws { Assert-RepairBundle $wrapperCandidate $wrapperTask '101' ('b' * 40) } '*forbidden*'
+    }
+    foreach ($case in @(
+        @{ key = 'allowedFiles'; value = @('scripts/postinstall.js') },
+        @{ key = 'repository'; value = 'https://github.com/another/project' },
+        @{ key = 'packageUrl'; value = 'https://example.invalid/package.tgz' },
+        @{ key = 'packageSha256'; value = 'invalid' },
+        @{ key = 'fork'; value = 'tester/agent-browser' },
+        @{ key = 'sourceSubdirectory'; value = 'elsewhere' }
+    )) {
+        $badTask = $wrapperTask.Clone(); $badTask.id = 'fixture'
+        $badTask[$case.key] = $case.value
+        Write-Json "$root\targets\github\fixture.json" $badTask
+        $loader = ". '$root\scripts\GitHubRepair.ps1'; Read-RepairTask fixture"
+        $code = Invoke-LoggedProcess $pwsh @('-NoProfile', '-Command', $loader) $root "$root\bad-task.log"
+        Assert ($code -ne 0 -and (Get-Content "$root\bad-task.log" -Raw) -like '*Only the reviewed*') "Reject unsupported wrapper task field $($case.key)"
+    }
     Assert-Throws { Read-RepairTask '..\smoke' } '*tracked, reviewed*'
     $null = New-Item -ItemType Directory -Path "$root\workspace"
     [IO.File]::WriteAllText("$root\workspace\main.cpp", 'source')

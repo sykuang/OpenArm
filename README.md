@@ -218,6 +218,23 @@ to 64 KiB per UTF-8 file and 128 KiB total. The configured generator, build and
 smoke commands must be appropriate for that reviewed target. This is not a
 universal porting adapter; Python/npm projects need their own reviewed validation.
 
+**Dependency launcher repair: `agent-browser-empty-launcher`.** Copilot, not the
+preparation script, edits only `bin/agent-browser.js` at the pinned v0.37.1 source.
+The adapter downloads the SHA256-pinned published package through the npm feed
+proxy without executing install scripts. It checks that the published wrapper
+matches the source and extracts only the wrapper, package metadata and x64 PE.
+On native Windows Arm64 Node.js, both preparation and independent validation
+compare clean-package `--version`/`--help` with an explicitly constructed
+zero-byte Arm64-file regression fixture. This does **not** establish that a clean
+v0.37.1 install creates the file or that it survives upgrades. Trusted launcher
+contracts cover missing/empty/directory paths, native preference, platform
+selection, arguments, exit codes and visible errors; they are not agent-editable.
+No x64 executable is relabeled Arm64. A passing candidate has status
+`compatibility_validated` and `nativeVerified: false`: **x64 emulation on an
+Arm64 host**, not a native port or a working browser session. This dependency
+task currently publishes no PR, even with `publishDraft: true`; its correct
+destination fork and publishing access require separate authorization.
+
 The jobs deliberately separate capabilities:
 
 - **Prepare:** fetch the pinned target and reproduce the native baseline without

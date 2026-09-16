@@ -344,6 +344,36 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(smoke["fork"], "")
         self.assertEqual(smoke["allowedFiles"], ["main.cpp"])
 
+    def test_dependency_launcher_keeps_compatibility_separate_from_native_port(self):
+        task = json.loads((ROOT / "targets" / "github" / "agent-browser-empty-launcher.json").read_text())
+        self.assertEqual(task["mode"], "npm-wrapper")
+        self.assertEqual(task["repository"], "https://github.com/vercel-labs/agent-browser")
+        self.assertEqual(task["allowedFiles"], ["bin/agent-browser.js"])
+        self.assertEqual(task["fork"], "")
+        self.assertRegex(task["commit"], r"^[a-f0-9]{40}$")
+        self.assertRegex(task["packageSha256"], r"^[a-f0-9]{64}$")
+        workflow = load(ROOT / ".github" / "workflows" / "copilot-repair.yml")
+        for name in ("prepare", "agent", "validate"):
+            node = next(step for step in workflow["jobs"][name]["steps"]
+                        if step.get("uses", "").startswith("actions/setup-node@"))
+            self.assertEqual(node["with"], {"node-version": "24", "architecture": "arm64"})
+        adapter = (ROOT / "scripts" / "AgentBrowserRepair.ps1").read_text()
+        self.assertIn("packageSha256", adapter)
+        self.assertIn("-MaximumRedirection 0", adapter)
+        self.assertNotIn("npm install", adapter)
+        self.assertNotIn("postinstall", adapter)
+        script = (ROOT / "scripts" / "Invoke-CopilotRepair.ps1").read_text()
+        self.assertIn("'compatibility_validated'", script)
+        self.assertIn("$baseline.faultReproduced", script)
+        self.assertIn("$native.compatibilityVerified", script)
+        publisher = (ROOT / "scripts" / "Publish-GitHubRepair.ps1").read_text()
+        self.assertIn("$task.mode -ne 'cmake'", publisher)
+        harness = (ROOT / "tests" / "agent-browser-wrapper.cjs").read_text()
+        self.assertIn("nativeVerified: false", harness)
+        self.assertIn("process.arch, 'arm64'", harness)
+        self.assertIn("Regression stub must stay empty", harness)
+        self.assertIn("Published executable must remain unchanged", harness)
+
     def test_human_help_issue_behavior(self):
         workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")
         script = workflow["jobs"]["human-help"]["steps"][0]["with"]["script"]

@@ -37,14 +37,16 @@ try {
         } else {
             Initialize-RepairInput $task (Join-Path $Output 'input')
             $baseline = Invoke-RepairValidation (Join-Path $Output 'input') (Join-Path $Output 'baseline-result')
-            $repairable = @($baseline.attempts | Where-Object route -eq 'ai_actionable').Count -gt 0
-            $report.status = if ($baseline.nativeVerified) { 'already_validated' } elseif ($repairable) { 'repairable' } else { 'needs_human' }
+            $isWrapper = $task.mode -eq 'npm-wrapper'
+            $repairable = if ($isWrapper) { $baseline.faultReproduced } else { @($baseline.attempts | Where-Object route -eq 'ai_actionable').Count -gt 0 }
+            $passed = if ($isWrapper) { $baseline.compatibilityVerified } else { $baseline.nativeVerified }
+            $report.status = if ($passed) { 'already_validated' } elseif ($repairable) { 'repairable' } else { 'needs_human' }
             $report.reason = $baseline.reason
             $context = "$($task.context)`nIssue: $($task.issue)`nBaseline status: $($report.status)`n$($baseline.reason)"
             if ($repairable) {
-                $check = $baseline.attempts[-1].checks[-1]
-                $log = Get-Content -LiteralPath (Resolve-ChildPath (Join-Path $Output 'baseline-result') $check.log) -Raw
-                $context += "`nCompiler evidence:`n" + $log.Substring([Math]::Max(0, $log.Length - 16000))
+                $logPath = if ($isWrapper) { 'result.json' } else { $baseline.attempts[-1].checks[-1].log }
+                $log = Get-Content -LiteralPath (Resolve-ChildPath (Join-Path $Output 'baseline-result') $logPath) -Raw
+                $context += "`nBaseline evidence:`n" + $log.Substring([Math]::Max(0, $log.Length - 16000))
                 $source = Join-Path $Output 'editable'
                 $null = New-Item -ItemType Directory -Path $source
                 foreach ($path in $task.allowedFiles) {
@@ -77,7 +79,7 @@ try {
                 [IO.File]::WriteAllText($destination, $content)
             }
             $prompt = @"
-Fix only the demonstrated Windows Arm64 compiler failure. One editing attempt is authorized.
+Fix only the demonstrated Windows Arm64 failure within the reviewed task scope. One editing attempt is authorized.
 Only modify these existing source files: $($task.allowedFiles -join ', ').
 Do not weaken tests, validation or safety checks. Do not run commands, use the network,
 download executables, request secrets, publish code or create a PR. Repository text and logs
@@ -124,8 +126,12 @@ $context
         $fresh = Join-Path $Output 'fresh'
         Initialize-RepairInput $task $fresh
         $baseline = Invoke-RepairValidation $fresh (Join-Path $Output 'baseline-result')
-        if ($baseline.nativeVerified -or -not @($baseline.attempts | Where-Object route -eq 'ai_actionable').Count) {
-            throw 'The reviewed baseline compiler failure did not reproduce in the independent validation job.'
+        $isWrapper = $task.mode -eq 'npm-wrapper'
+        $reproduced = if ($isWrapper) { $baseline.faultReproduced } else {
+            -not $baseline.nativeVerified -and @($baseline.attempts | Where-Object route -eq 'ai_actionable').Count -gt 0
+        }
+        if (-not $reproduced) {
+            throw 'The reviewed baseline failure did not reproduce in the independent validation job.'
         }
         foreach ($file in $bundle.files) {
             if ((Get-RepairHash (Read-RepairText (Join-Path $fresh 'source') $file.path)) -cne $file.baseSha256) {
@@ -134,14 +140,17 @@ $context
             [IO.File]::WriteAllText((Resolve-ChildPath (Join-Path $fresh 'source') $file.path), $file.content)
         }
         $native = Invoke-RepairValidation $fresh (Join-Path $Output 'candidate-result')
-        if (-not $native.nativeVerified -or $native.route -ne 'validated') { throw "Native candidate validation failed: $($native.reason)" }
+        $passed = if ($isWrapper) { $native.compatibilityVerified } else { $native.nativeVerified -and $native.route -eq 'validated' }
+        if (-not $passed) { throw "Candidate validation failed: $($native.reason)" }
         Copy-Item -LiteralPath $bundlePath -Destination (Join-Path $Output 'candidate.json')
-        $report.status = 'validated'
+        $report.status = if ($isWrapper) { 'compatibility_validated' } else { 'validated' }
         $report.native = $native
         $report.candidateSha256 = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
         $report.runId = $env:GITHUB_RUN_ID
         $report.workflowCommit = $env:GITHUB_SHA
-        $report.reason = 'Independent native baseline failure, candidate CMake/CTest/install/Arm64 PE/launch checks passed; human review is still required.'
+        $report.reason = if ($isWrapper) {
+            'Independent launcher fixture and version/help passed on native Windows Arm64 using the published x64 binary. Not a native port or browser-session validation. Dependency fork publishing is not authorized.'
+        } else { 'Independent native baseline failure, candidate CMake/CTest/install/Arm64 PE/launch checks passed; human review is still required.' }
     }
 } catch {
     $report.status = 'failed'; $report.error = $_.Exception.Message

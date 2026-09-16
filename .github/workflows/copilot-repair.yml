@@ -32,7 +32,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Prepare reviewed evidence and reproduce CMake baseline when applicable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          architecture: arm64
+      - name: Prepare reviewed evidence and reproduce the configured baseline
         run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Prepare -Output "$env:RUNNER_TEMP\prepared" -OutputRoot "$env:RUNNER_TEMP"
         env:
           OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
@@ -121,6 +125,10 @@ jobs:
         with:
           name: repair-agent-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}\candidate
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          architecture: arm64
       - name: Independently reproduce baseline and validate only allowlisted source changes
         id: validate
         run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Validate -InputPath "$env:RUNNER_TEMP\candidate" -Output "$env:RUNNER_TEMP\validated" -OutputRoot "$env:RUNNER_TEMP"
