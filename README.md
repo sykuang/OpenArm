@@ -223,8 +223,9 @@ The jobs deliberately separate capabilities:
 - **Prepare:** fetch the pinned target and reproduce the native baseline without
   either Copilot or publishing credentials. Only classified compiler/architecture
   failures permit remediation; access problems and unknown failures need a human.
-- **Agent:** first verify actual AI access, then allow one edit of the selected
-  source files. Shell, web fetching, built-in MCP servers and custom repository
+- **Agent:** first verify actual AI access with no tools, then allow one edit of
+  the selected source files using file tools and absolute-path write permissions.
+  Shell, URL access, built-in MCP servers and custom repository
   instructions are disabled; default path checks stay on. No unrestricted
   `--yolo`, arbitrary validation commands or publishing token is provided.
 - **Validate:** on a fresh Arm64 runner, re-fetch the pinned source, reproduce the

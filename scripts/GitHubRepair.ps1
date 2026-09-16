@@ -110,12 +110,19 @@ function Invoke-RepairValidation([string] $InputPath, [string] $Output) {
     }
 }
 
-function Invoke-RepairCopilot([string] $Prompt, [string] $WorkingDirectory, [string] $Log, [switch] $Edit) {
+function Invoke-RepairCopilot([string] $Prompt, [string] $WorkingDirectory, [string] $Log, [string[]] $EditableFiles = @()) {
     if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) { throw 'Copilot requires the Actions GITHUB_TOKEN and copilot-requests: write.' }
     $arguments = @('-p', $Prompt, '-s', '--no-ask-user', '--no-custom-instructions', '--disable-builtin-mcps',
-        '--disallow-temp-dir', '--deny-tool=shell', '--deny-tool=web_fetch')
-    if ($Edit) { $arguments += @('--allow-tool=read', '--allow-tool=write') }
-    else { $arguments += '--deny-tool=*' }
+        '--disallow-temp-dir', '--deny-tool=shell', '--deny-tool=url', '--secret-env-vars=GITHUB_TOKEN')
+    if ($EditableFiles.Count) {
+        $arguments += '--available-tools=view,edit,create,glob,grep,rg,apply_patch'
+        foreach ($path in $EditableFiles) {
+            $arguments += "--allow-tool=write($(Resolve-ChildPath $WorkingDirectory $path))"
+        }
+    } else {
+        # An explicit empty availability list hides all tools; "*" is not a permission kind.
+        $arguments += '--available-tools'
+    }
     $code = Invoke-LoggedProcess copilot $arguments $WorkingDirectory $Log 600 -Agent -ActionsCopilot
     if ($code -ne 0) { throw "Copilot request failed (exit $code); see $Log. No automatic request retry." }
 }

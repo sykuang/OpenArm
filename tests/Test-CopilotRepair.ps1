@@ -197,14 +197,16 @@ try {
         Assert ($File -eq 'copilot' -and $Agent -and $ActionsCopilot -and $TimeoutSeconds -eq 600) 'Copilot command uses explicit agent authentication and fixed timeout'
         Assert ($Arguments -contains '--no-custom-instructions' -and $Arguments -contains '--disable-builtin-mcps' -and
             $Arguments -contains '--disallow-temp-dir' -and $Arguments -contains '--deny-tool=shell') 'Copilot uses bounded noninteractive permissions'
-        Assert (@($Arguments | Where-Object { $_ -match 'yolo|allow-all|autopilot' }).Count -eq 0) 'No unbounded permission or retry mode'
+        Assert (@($Arguments | Where-Object { $_ -match 'yolo|allow-all|autopilot' }).Count -eq 0 -and
+            $Arguments -notcontains '--deny-tool=*') 'No unbounded permission, invalid wildcard, or retry mode'
         $script:lastArguments = $Arguments
         return 0
     }
     Invoke-RepairCopilot 'diagnose' $root "$root\mock-agent.log"
-    Assert ($lastArguments -contains '--deny-tool=*' -and $lastArguments -notcontains '--allow-tool=write') 'Diagnosis and auth allow no tools'
-    Invoke-RepairCopilot 'repair' $root "$root\mock-agent.log" -Edit
-    Assert ($lastArguments -contains '--allow-tool=read' -and $lastArguments -contains '--allow-tool=write') 'Editing attempt grants only source read/write categories'
+    Assert ($lastArguments[-1] -eq '--available-tools' -and @($lastArguments | Where-Object { $_ -like '--allow-tool=*' }).Count -eq 0) 'Diagnosis and auth explicitly expose an empty tool list'
+    Invoke-RepairCopilot 'repair' $root "$root\mock-agent.log" -EditableFiles @('main.cpp')
+    Assert ($lastArguments -contains '--available-tools=view,edit,create,glob,grep,rg,apply_patch' -and
+        $lastArguments -contains "--allow-tool=write($root\main.cpp)" -and $lastArguments -notcontains '--allow-tool=write') 'Editing exposes only file tools and grants writes only to absolute allowlisted files'
     $env:GITHUB_TOKEN = ''
     Assert-Throws { Invoke-RepairCopilot 'missing auth' $root "$root\missing.log" } '*GITHUB_TOKEN*'
     Write-Host "Passed $checks Copilot repair checks."

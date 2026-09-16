@@ -86,7 +86,7 @@ Explain the change and limitations. A separate native job will validate it.
 DATA:
 $context
 "@
-            Invoke-RepairCopilot $prompt $workspace (Join-Path $Output 'copilot.log') -Edit
+            Invoke-RepairCopilot $prompt $workspace (Join-Path $Output 'copilot.log') -EditableFiles $task.allowedFiles
             Assert-RepairWorkspace $workspace $task
             $bundle = @{ schemaVersion = 1; taskId = $task.id; runId = $env:GITHUB_RUN_ID; workflowCommit = $env:GITHUB_SHA
                 sourceCommit = $task.commit; files = @() }
