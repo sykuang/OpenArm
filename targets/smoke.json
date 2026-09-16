@@ -1,0 +1,10 @@
+{
+  "id": "openarm-smoke",
+  "repository": "self",
+  "commit": "self",
+  "sourceSubdirectory": "samples\\arm64-smoke",
+  "generator": "Visual Studio 17 2022",
+  "executable": "bin\\openarm-smoke.exe",
+  "smokeArguments": ["--smoke-test"],
+  "performanceSamples": 5
+}

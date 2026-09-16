@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.21)
+project(openarm_smoke LANGUAGES CXX)
+add_executable(openarm-smoke main.cpp)
+target_compile_features(openarm-smoke PRIVATE cxx_std_17)
+enable_testing()
+add_test(NAME core-workflow COMMAND openarm-smoke --smoke-test)
+install(TARGETS openarm-smoke RUNTIME DESTINATION bin)

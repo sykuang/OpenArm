@@ -1,0 +1,307 @@
+trigger: none
+pr: none
+
+parameters:
+- name: targetConfig
+  type: string
+  default: targets\smoke.json
+- name: nativePool
+  type: string
+  default: OpenArm-Windows-ARM64
+- name: enableAgent
+  type: boolean
+  default: false
+- name: maxAttempts
+  type: number
+  default: 2
+  values: [0, 1, 2, 3]
+- name: enableHumanHandoff
+  type: boolean
+  default: false
+- name: enableTeams
+  type: boolean
+  default: false
+- name: approvers
+  type: string
+  default: ''
+- name: prepareUpstreamDraft
+  type: boolean
+  default: false
+
+stages:
+- stage: Prepare
+  displayName: Pin the target and prepare source
+  jobs:
+  - job: Prepare
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: self
+      persistCredentials: false
+    - task: PowerShell@2
+      inputs:
+        pwsh: true
+        filePath: scripts\Prepare-Target.ps1
+      env:
+        OPENARM_CONFIG: ${{ parameters.targetConfig }}
+        OPENARM_OUTPUT: $(Pipeline.Workspace)\openarm-input
+        OPENARM_REQUIRE_APPROVERS: ${{ or(parameters.enableHumanHandoff, parameters.prepareUpstreamDraft) }}
+        OPENARM_APPROVERS: ${{ parameters.approvers }}
+        OPENARM_TEAMS: ${{ parameters.enableTeams }}
+        OPENARM_HANDOFF: ${{ parameters.enableHumanHandoff }}
+    - publish: $(Pipeline.Workspace)\openarm-input
+      artifact: openarm-input
+
+- template: native-stage.yml
+  parameters:
+    stageName: Native
+    dependsOn: Prepare
+    inputArtifact: openarm-input
+    outputArtifact: openarm-native
+    nativePool: ${{ parameters.nativePool }}
+    enableAgent: ${{ parameters.enableAgent }}
+    maxAttempts: ${{ parameters.maxAttempts }}
+
+- stage: Handoff
+  displayName: Create or update the volunteer work item
+  dependsOn: Native
+  condition: and(succeeded(), ${{ parameters.enableHumanHandoff }}, eq(dependencies.Native.outputs['Validate.run.route'], 'needs_human'))
+  lockBehavior: sequential
+  jobs:
+  - deployment: Coordinate
+    environment: openarm-coordination
+    pool:
+      vmImage: windows-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: false
+          - download: none
+          - download: current
+            artifact: openarm-native
+          - task: PowerShell@2
+            inputs:
+              pwsh: true
+              filePath: scripts\Sync-WorkItem.ps1
+              arguments: -Mode Blocked
+            env:
+              OPENARM_EVIDENCE: $(Pipeline.Workspace)\openarm-native
+              OPENARM_OUTPUT: $(Pipeline.Workspace)\openarm-handoff
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              OPENARM_TEAMS: ${{ parameters.enableTeams }}
+              OPENARM_TEAMS_BRIDGE_URL: $(OpenArm.TeamsBridgeUrl)
+          - publish: $(Pipeline.Workspace)\openarm-handoff
+            artifact: openarm-handoff
+            condition: always()
+
+- stage: Human
+  displayName: Signal that volunteer guidance is ready
+  dependsOn: Handoff
+  condition: succeeded()
+  jobs:
+  - job: Wait
+    pool: server
+    timeoutInMinutes: 4350
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 4320
+      inputs:
+        notifyUsers: ${{ parameters.approvers }}
+        approvers: ${{ parameters.approvers }}
+        allowApproversToApproveTheirOwnRuns: false
+        instructions: |
+          Open the Azure Boards item linked in the Handoff stage summary.
+          Claim it with Assigned To. Add a NEW comment beginning OPENARM_GUIDANCE:
+          followed by the guidance, access coordination, or testing results.
+          If an agent has pushed a fix to the configured GitHub repository, add
+          OPENARM_COMMIT: <full 40-character SHA> on a separate line in that comment.
+          The claimed owner must author and last edit the guidance comment.
+          Do not write code manually. This gate signals readiness ONLY; it does
+          not authorize target execution. A frozen source/guidance snapshot is
+          created next, followed by a separate approval of its exact digest.
+          Reject or timeout leaves the blocker open.
+        onTimeout: reject
+
+- stage: ResumeInput
+  displayName: Freeze source and owner guidance for approval
+  dependsOn: Human
+  jobs:
+  - job: Resume
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: self
+      persistCredentials: false
+    - download: current
+      artifact: openarm-native
+    - download: current
+      artifact: openarm-handoff
+    - task: PowerShell@2
+      name: snapshot
+      inputs:
+        pwsh: true
+        filePath: scripts\Resume-Target.ps1
+      env:
+        OPENARM_EVIDENCE: $(Pipeline.Workspace)\openarm-native
+        OPENARM_HANDOFF_STATE: $(Pipeline.Workspace)\openarm-handoff\work-item.json
+        OPENARM_OUTPUT: $(Pipeline.Workspace)\openarm-resume-input
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    - publish: $(Pipeline.Workspace)\openarm-resume-input
+      artifact: openarm-resume-input
+
+- stage: ResumeApproval
+  displayName: Approve the exact immutable resume snapshot
+  dependsOn: ResumeInput
+  variables:
+    bundleDigest: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.bundleDigest'] ]
+    sourceCommit: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.sourceCommit'] ]
+    workItemId: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.workItemId'] ]
+    commentId: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.commentId'] ]
+    commentVersion: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.commentVersion'] ]
+  jobs:
+  - job: Approve
+    pool: server
+    timeoutInMinutes: 1470
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: ${{ parameters.approvers }}
+        approvers: ${{ parameters.approvers }}
+        allowApproversToApproveTheirOwnRuns: false
+        instructions: |
+          Authorize ONLY the openarm-resume-input artifact from this build.
+          Work item: $(workItemId)
+          Guidance comment/version: $(commentId) / $(commentVersion)
+          Checkout commit: $(sourceCommit)
+          Manifest SHA-256: $(bundleDigest)
+          Review the ResumeInput summary, guidance.txt, approval.json and source.
+          The manifest covers the complete source, baseline, config and guidance.
+          Later work-item comments will NOT be read or executed. To change input,
+          reject this gate and produce a new snapshot with a new approval.
+          The native job will reject a digest, content or build-ID mismatch.
+        onTimeout: reject
+
+- template: native-stage.yml
+  parameters:
+    stageName: NativeResume
+    dependsOn: [ResumeInput, ResumeApproval]
+    inputArtifact: openarm-resume-input
+    outputArtifact: openarm-resumed
+    nativePool: ${{ parameters.nativePool }}
+    enableAgent: ${{ parameters.enableAgent }}
+    maxAttempts: ${{ parameters.maxAttempts }}
+    requireResumeApproval: true
+
+- stage: Report
+  displayName: Report results to the original work item and thread
+  dependsOn: [Handoff, NativeResume]
+  condition: and(not(canceled()), eq(dependencies.Handoff.result, 'Succeeded'), eq(dependencies.NativeResume.result, 'Succeeded'))
+  lockBehavior: sequential
+  jobs:
+  - deployment: Coordinate
+    environment: openarm-coordination
+    pool:
+      vmImage: windows-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: false
+          - download: none
+          - download: current
+            artifact: openarm-resumed
+          - download: current
+            artifact: openarm-handoff
+          - task: PowerShell@2
+            inputs:
+              pwsh: true
+              filePath: scripts\Sync-WorkItem.ps1
+              arguments: -Mode Result
+            env:
+              OPENARM_EVIDENCE: $(Pipeline.Workspace)\openarm-resumed
+              OPENARM_HANDOFF_STATE: $(Pipeline.Workspace)\openarm-handoff\work-item.json
+              OPENARM_OUTPUT: $(Pipeline.Workspace)\openarm-report
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              OPENARM_TEAMS: ${{ parameters.enableTeams }}
+              OPENARM_TEAMS_BRIDGE_URL: $(OpenArm.TeamsBridgeUrl)
+          - publish: $(Pipeline.Workspace)\openarm-report
+            artifact: openarm-report
+            condition: always()
+
+- stage: Finish
+  displayName: Enforce the validation outcome
+  dependsOn: [Prepare, Native, Handoff, Human, ResumeInput, ResumeApproval, NativeResume, Report]
+  condition: not(canceled())
+  variables:
+    initialRoute: $[ stageDependencies.Native.Validate.outputs['run.route'] ]
+    resumedRoute: $[ stageDependencies.NativeResume.Validate.outputs['run.route'] ]
+    reportResult: $[ dependencies.Report.result ]
+  jobs:
+  - job: Check
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: none
+    - pwsh: |
+        if ($env:INITIAL_ROUTE -eq 'validated') {
+          Write-Host '##vso[task.setvariable variable=artifact;isOutput=true]openarm-native'
+        } elseif ($env:RESUMED_ROUTE -eq 'validated' -and $env:REPORT_RESULT -eq 'Succeeded') {
+          Write-Host '##vso[task.setvariable variable=artifact;isOutput=true]openarm-resumed'
+        } else {
+          throw 'OpenArm is not natively validated. Inspect evidence and the human-input gate; no contribution is ready.'
+        }
+      name: finalize
+      env:
+        INITIAL_ROUTE: $(initialRoute)
+        RESUMED_ROUTE: $(resumedRoute)
+        REPORT_RESULT: $(reportResult)
+
+- stage: UpstreamReview
+  displayName: Human review and upstream opt-in
+  dependsOn: Finish
+  condition: and(succeeded(), ${{ parameters.prepareUpstreamDraft }})
+  jobs:
+  - job: Review
+    pool: server
+    timeoutInMinutes: 1470
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: ${{ parameters.approvers }}
+        approvers: ${{ parameters.approvers }}
+        allowApproversToApproveTheirOwnRuns: false
+        instructions: |
+          Review source changes, architecture evidence, package launch, tests,
+          performance samples, and maintainer contribution policy.
+          Approve only with documented maintainer opt-in. This produces a draft
+          artifact only; a human must review and submit any upstream PR.
+        onTimeout: reject
+
+- stage: Draft
+  displayName: Prepare an evidence-backed contribution draft
+  dependsOn: [Finish, UpstreamReview]
+  variables:
+    evidenceArtifact: $[ stageDependencies.Finish.Check.outputs['finalize.artifact'] ]
+  jobs:
+  - job: Package
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: self
+      persistCredentials: false
+    - download: current
+      artifact: $(evidenceArtifact)
+    - task: PowerShell@2
+      inputs:
+        pwsh: true
+        filePath: scripts\New-ContributionDraft.ps1
+      env:
+        OPENARM_EVIDENCE: $(Pipeline.Workspace)\$(evidenceArtifact)
+        OPENARM_OUTPUT: $(Pipeline.Workspace)\openarm-contribution
+    - publish: $(Pipeline.Workspace)\openarm-contribution
+      artifact: openarm-contribution

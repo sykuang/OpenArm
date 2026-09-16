@@ -1,0 +1,62 @@
+parameters:
+- name: stageName
+  type: string
+- name: dependsOn
+  type: object
+- name: inputArtifact
+  type: string
+- name: outputArtifact
+  type: string
+- name: nativePool
+  type: string
+- name: enableAgent
+  type: boolean
+- name: maxAttempts
+  type: number
+- name: requireResumeApproval
+  type: boolean
+  default: false
+
+stages:
+- stage: ${{ parameters.stageName }}
+  displayName: Native Windows Arm64 validation
+  dependsOn: ${{ parameters.dependsOn }}
+  variables:
+    ${{ if parameters.requireResumeApproval }}:
+      approvedResumeDigest: $[ stageDependencies.ResumeInput.Resume.outputs['snapshot.bundleDigest'] ]
+  jobs:
+  - job: Validate
+    timeoutInMinutes: 120
+    cancelTimeoutInMinutes: 5
+    pool:
+      name: ${{ parameters.nativePool }}
+      demands:
+      - Agent.OS -equals Windows_NT
+      - OpenArm.NativeArm64 -equals true
+    workspace:
+      clean: all
+    steps:
+    - checkout: self
+      persistCredentials: false
+    - download: current
+      artifact: ${{ parameters.inputArtifact }}
+    - task: PowerShell@2
+      name: run
+      displayName: Reproduce, classify, remediate and validate
+      inputs:
+        pwsh: true
+        filePath: scripts\Invoke-NativeLoop.ps1
+      env:
+        OPENARM_INPUT: $(Pipeline.Workspace)\${{ parameters.inputArtifact }}
+        OPENARM_OUTPUT: $(Pipeline.Workspace)\${{ parameters.outputArtifact }}
+        OPENARM_BUILD: $(Agent.TempDirectory)\openarm-$(Build.BuildId)-$(System.JobId)
+        OPENARM_ENABLE_AGENT: ${{ parameters.enableAgent }}
+        OPENARM_MAX_ATTEMPTS: ${{ parameters.maxAttempts }}
+        OPENARM_REQUIRE_RESUME_APPROVAL: ${{ parameters.requireResumeApproval }}
+        ${{ if parameters.requireResumeApproval }}:
+          OPENARM_APPROVED_RESUME_DIGEST: $(approvedResumeDigest)
+        ${{ if parameters.enableAgent }}:
+          COPILOT_GITHUB_TOKEN: $(OpenArm.CopilotToken)
+    - publish: $(Pipeline.Workspace)\${{ parameters.outputArtifact }}
+      artifact: ${{ parameters.outputArtifact }}
+      condition: always()
