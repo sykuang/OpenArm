@@ -1,0 +1,15 @@
+{
+  "id": "cmake-smoke",
+  "mode": "cmake",
+  "repository": "self",
+  "commit": "self",
+  "sourceSubdirectory": "samples\\arm64-smoke",
+  "generator": "Visual Studio 17 2022",
+  "executable": "bin\\openarm-smoke.exe",
+  "smokeArguments": ["--smoke-test"],
+  "performanceSamples": 3,
+  "issue": "",
+  "context": "Validate the existing OpenArm CMake smoke application on native Windows Arm64. Do not introduce a failure or unnecessary change. This self-test cannot publish a PR.",
+  "allowedFiles": ["main.cpp"],
+  "fork": ""
+}

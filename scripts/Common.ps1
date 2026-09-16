@@ -88,8 +88,9 @@ function Assert-Target($Config) {
 function Invoke-LoggedProcess {
     param(
         [string] $File, [string[]] $Arguments = @(), [string] $WorkingDirectory,
-        [string] $Log, [int] $TimeoutSeconds = 900, [switch] $Agent
+        [string] $Log, [int] $TimeoutSeconds = 900, [switch] $Agent, [switch] $ActionsCopilot
     )
+    if ($ActionsCopilot -and -not $Agent) { throw 'Actions Copilot authentication is only available to agent processes.' }
     $command = Get-Command $File -CommandType Application -ErrorAction Stop | Select-Object -First 1
     if ($command.Source -match '\.(cmd|bat)$') { throw "Use a native executable, not a command shim: $File" }
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -101,7 +102,8 @@ function Invoke-LoggedProcess {
     foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
     foreach ($key in @($start.Environment.Keys)) {
         if ($key -match '(?i)(TOKEN|SECRET|PASSWORD|ACCESSTOKEN|BRIDGE_URL)' -and
-            -not ($Agent -and $key -eq 'COPILOT_GITHUB_TOKEN')) {
+            -not ($Agent -and (($key -eq 'COPILOT_GITHUB_TOKEN' -and -not $ActionsCopilot) -or
+                ($key -eq 'GITHUB_TOKEN' -and $ActionsCopilot)))) {
             $null = $start.Environment.Remove($key)
         }
     }

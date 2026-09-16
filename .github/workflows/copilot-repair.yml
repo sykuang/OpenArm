@@ -1,0 +1,170 @@
+name: Copilot diagnosis and reviewed repair
+
+'on':
+  workflow_dispatch:
+    inputs:
+      repairTask:
+        description: Reviewed task in targets/github (Hermes is diagnosis-only)
+        type: string
+        required: true
+        default: hermes-browser-77488
+      publishDraft:
+        description: Publish only an independently validated external CMake repair inside its reviewed fork
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openarm-repair-${{ github.repository_id }}-${{ inputs.repairTask }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  prepare:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare reviewed evidence and reproduce CMake baseline when applicable
+        run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Prepare -Output "$env:RUNNER_TEMP\prepared" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+      - name: Preserve preparation evidence without transferring executable source
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repair-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}\prepared\report.json
+            ${{ runner.temp }}\prepared\context.txt
+            ${{ runner.temp }}\prepared\editable
+            ${{ runner.temp }}\prepared\baseline-result\result.json
+            ${{ runner.temp }}\prepared\baseline-result\logs
+          if-no-files-found: error
+          retention-days: 7
+
+  agent:
+    needs: prepare
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      status: ${{ steps.repair.outputs.status }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: repair-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\prepared
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          architecture: arm64
+      - name: Install and verify native Copilot CLI
+        run: |
+          node --eval "if (process.platform !== 'win32' || process.arch !== 'arm64') throw new Error('Native Windows Arm64 Node.js is required')"
+          if ($LASTEXITCODE -ne 0) { throw 'Node.js architecture check failed.' }
+          npm install --global @github/copilot@1.0.85 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI installation failed.' }
+          $npmRoot = npm root --global
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the global npm installation.' }
+          $copilotExe = node --eval "process.stdout.write(require.resolve('@github/copilot-win32-arm64', { paths: [process.argv[1]] }))" "$npmRoot\@github\copilot"
+          if ($LASTEXITCODE -ne 0) { throw 'The native Windows Arm64 Copilot package is missing.' }
+          . .\scripts\Common.ps1
+          if ((Get-PeMachine $copilotExe) -ne 0xAA64) { throw 'Copilot CLI is not a native Arm64 executable.' }
+          & $copilotExe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
+          Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
+          Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
+      - name: Verify AI access and perform one bounded diagnosis or editing attempt
+        id: repair
+        run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Agent -InputPath "$env:RUNNER_TEMP\prepared" -Output "$env:RUNNER_TEMP\agent" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Preserve AI evidence and untrusted candidate
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repair-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}\agent\report.json
+            ${{ runner.temp }}\agent\auth.log
+            ${{ runner.temp }}\agent\copilot.log
+            ${{ runner.temp }}\agent\candidate.json
+          if-no-files-found: error
+          retention-days: 7
+
+  validate:
+    needs: agent
+    if: ${{ needs.agent.outputs.status == 'candidate' }}
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    outputs:
+      status: ${{ steps.validate.outputs.status }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: repair-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\candidate
+      - name: Independently reproduce baseline and validate only allowlisted source changes
+        id: validate
+        run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Validate -InputPath "$env:RUNNER_TEMP\candidate" -Output "$env:RUNNER_TEMP\validated" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+      - name: Preserve independent native evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repair-validated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}\validated\report.json
+            ${{ runner.temp }}\validated\candidate.json
+            ${{ runner.temp }}\validated\baseline-result\result.json
+            ${{ runner.temp }}\validated\baseline-result\logs
+            ${{ runner.temp }}\validated\candidate-result\result.json
+            ${{ runner.temp }}\validated\candidate-result\logs
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: validate
+    if: ${{ inputs.publishDraft && needs.validate.outputs.status == 'validated' }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: repair-validated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\validated
+      - name: Publish the exact validated diff as a draft PR inside the reviewed fork
+        run: .\scripts\Publish-GitHubRepair.ps1 -InputPath "$env:RUNNER_TEMP\validated" -Output "$env:RUNNER_TEMP\published" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_PUBLISH_DRAFT: ${{ inputs.publishDraft }}
+          OPENARM_GITHUB_TOKEN: ${{ secrets.OPENARM_GITHUB_TOKEN }}
+      - name: Preserve mutation journal including ambiguous failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repair-published-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\published
+          if-no-files-found: error
+          retention-days: 7

@@ -191,7 +191,7 @@ try {
         Reset-Mock
         $env:OPENARM_GITHUB_DISCOVERY_TOKEN = $token
         $run = Run-Discovery "anonymous-$([guid]::NewGuid())"
-        Assert (-not $run.error -and $run.report.authMode -eq 'anonymous') 'Missing or unexpanded optional token uses explicit anonymous mode'
+        Assert (-not $run.error -and $run.report.authMode -eq 'anonymous') "Missing or unexpanded optional token uses explicit anonymous mode: $($run.error)"
         Assert (@($global:DiscoveryMock.calls | Where-Object authorization -ne '').Count -eq 0) 'Anonymous mode never falls back to the enterprise token'
         Assert ($global:DiscoveryMock.sleeps.Count -eq 20 -and @($global:DiscoveryMock.sleeps | Where-Object { $_ -ne 7 }).Count -eq 0) 'Anonymous searches are paced below ten per minute'
     }

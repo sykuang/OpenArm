@@ -5,6 +5,11 @@ reported Windows Arm64 work or create a documentation-only draft PR inside your
 fork. This read-only discovery/API fork trial uses GitHub's hosted Windows Arm64 runner and installs
 native Copilot CLI; it needs no Azure DevOps setup or self-hosted worker.
 
+The separate **Copilot diagnosis and reviewed repair** workflow makes actual AI
+requests. It defaults to diagnosis of the Hermes browser report, not an invented
+port. Reviewed CMake targets can use a bounded edit, independent native validation
+and opt-in draft-PR publisher. See [Copilot setup](#run-copilot-diagnosis-and-reviewed-repairs).
+
 The separate native-porting prototype still uses queue-only Azure Pipelines.
 It includes a small runnable C++ application, actual native validation, bounded
 Copilot CLI remediation, an Azure Boards volunteer gate, optional Teams delivery,
@@ -164,6 +169,97 @@ REST reference: [search syntax, scope, incomplete results and rate limits](https
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
 Actions reference: [running a manual workflow](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+## Run Copilot diagnosis and reviewed repairs
+
+Publish `.github\workflows\copilot-repair.yml`, its scripts and the reviewed
+`targets\github` manifests on your trusted default branch. Open **Actions >
+Copilot diagnosis and reviewed repair > Run workflow**. The original discovery
+and documentation-only fork trial remains unchanged.
+
+The **agent job alone** grants `contents: read` and `copilot-requests: write`,
+then passes the built-in `GITHUB_TOKEN` only to the Copilot step. No additional
+Copilot PAT is normally needed. The repository owner's Copilot entitlement,
+allowance, billing and applicable policies must permit Actions requests. Each
+run makes one exact-response authentication request; a diagnostic or repair
+requires at most one additional CLI invocation. Each invocation times out after
+10 minutes and is not retried. This bounds attempts and elapsed time, **not
+credits**: an editing invocation may make multiple model requests. No model or
+subscription setting is changed. See the
+[official Copilot Actions guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli-in-actions).
+
+**Default task: `hermes-browser-77488`.** This sends actual Copilot requests with
+reviewed issue context and selected source files from Hermes commit
+`682a95258ce9e877cfb607a5ada6436183efdebb`. It is deliberately **diagnosis-only**:
+the report concerns an external `agent-browser` npm binary, and
+[PR #77093](https://github.com/NousResearch/hermes-agent/pull/77093) was already
+open when the task was reviewed. The adapter does not download or execute that
+npm package, reproduce the browser failure, claim a native port, edit Hermes or
+create a PR, even if `publishDraft` is selected. Its expected result is
+`needs_human` with `authVerified: true` and a Copilot analysis. Review the existing
+PR and reproduce the exact package/browser behavior on Windows Arm64 before
+registering an appropriate repair adapter. An API report, title or successful
+`--version` is not that reproduction.
+
+**Native pipeline self-test: `cmake-smoke`.** This builds the existing sample
+with CMake/CTest, installs it, checks every installed EXE/DLL for Arm64 PE machine
+`0xAA64`, and launches its smoke command on `windows-11-arm`. A passing baseline
+returns `already_validated`; no unnecessary AI edit or PR is made. The Copilot
+authentication probe still runs. A self target never publishes externally.
+
+For a real **CMake** repair, add and review a tracked
+`targets\github\<task-id>.json` manifest before dispatch. Use the CMake fields
+from `cmake-smoke.json`, set `repository` to a public GitHub HTTPS URL and `commit`
+to a full immutable SHA, and supply the specific `issue`, `context`, and distinct
+`fork` (`OWNER/REPO`). `allowedFiles` permits at most five existing C/C++ source
+files or `CMakeLists.txt`, relative to `sourceSubdirectory`; tests, workflow files,
+arbitrary scripts, deletions and new files are not supported. Changes are limited
+to 64 KiB per UTF-8 file and 128 KiB total. The configured generator, build and
+smoke commands must be appropriate for that reviewed target. This is not a
+universal porting adapter; Python/npm projects need their own reviewed validation.
+
+The jobs deliberately separate capabilities:
+
+- **Prepare:** fetch the pinned target and reproduce the native baseline without
+  either Copilot or publishing credentials. Only classified compiler/architecture
+  failures permit remediation; access problems and unknown failures need a human.
+- **Agent:** first verify actual AI access, then allow one edit of the selected
+  source files. Shell, web fetching, built-in MCP servers and custom repository
+  instructions are disabled; default path checks stay on. No unrestricted
+  `--yolo`, arbitrary validation commands or publishing token is provided.
+- **Validate:** on a fresh Arm64 runner, re-fetch the pinned source, reproduce the
+  baseline, check candidate identity/path/content hashes, and re-run the full
+  configured native validation. AI success alone never authorizes publication.
+- **Publish:** only after independent validation and `publishDraft: true`, use
+  `OPENARM_GITHUB_TOKEN` in a separate API-only job. The exact candidate is bound
+  to the task, workflow commit and run. The existing fork must match the source
+  network, have no active Actions workflows, and have its default branch still
+  at the pinned base. No fork creation, sync, reset, force push, upstream PR or
+  merge occurs. A rerun refuses an existing repair branch; ambiguous writes are
+  journaled and never retried automatically.
+
+For publishing, use the fine-grained fork-only token described below (Contents
+and Pull requests write; Actions read). Keep the fork free of secrets and
+external automation. Copilot permission controls and environment scrubbing are
+**not an OS sandbox**. Reviewed target code and generated changes execute only on
+disposable hosted runners, not in the publisher; inspect the draft diff and logs
+before trusting or merging it. The publisher does not audit third-party webhooks
+or grant additional permissions. Protect workflow/manifest changes with your
+normal repository review controls.
+
+Download `repair-prepared-*`, `repair-agent-*`, `repair-validated-*` and, when
+applicable, `repair-published-*` artifacts for `report.json`, `auth.log`,
+`copilot.log`, candidate content and native logs/mutation receipts. They are
+run-and-attempt scoped and retained for seven days, including failures. A
+successful diagnostic job with `needs_human` means the analysis completed, **not
+that the issue was fixed**. Authentication errors, unreproduced failures, no
+eligible changes, failed native checks or publication guards produce no PR;
+inspect the artifact and job summary. This workflow does not automatically
+create a human-help issue or resume from comments.
+
+`tests\Test-CopilotRepair.ps1` covers credential filtering, bounded CLI arguments,
+candidate validation and the publisher's REST behavior with offline doubles.
+Repository CI never calls Copilot or writes to a real fork.
 
 ## Try GitHub repository checks, a fork, and a draft PR
 

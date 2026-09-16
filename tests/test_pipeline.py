@@ -281,6 +281,69 @@ class PipelineChecks(unittest.TestCase):
         self.assertNotIn("${{", step["with"]["script"])
         self.assertNotIn("secrets.", str(job))
 
+    def test_copilot_repair_is_manual_and_separates_capabilities(self):
+        workflow = load(ROOT / ".github" / "workflows" / "copilot-repair.yml")
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(inputs), {"repairTask", "publishDraft"})
+        self.assertEqual(inputs["repairTask"]["default"], "hermes-browser-77488")
+        self.assertIs(inputs["publishDraft"]["default"], False)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        jobs = workflow["jobs"]
+        self.assertEqual(set(jobs), {"prepare", "agent", "validate", "publish"})
+        self.assertEqual(jobs["agent"]["needs"], "prepare")
+        self.assertEqual(jobs["validate"]["needs"], "agent")
+        self.assertEqual(jobs["publish"]["needs"], "validate")
+        self.assertEqual(jobs["agent"]["permissions"], {"contents": "read", "copilot-requests": "write"})
+        self.assertEqual(jobs["validate"]["if"], "${{ needs.agent.outputs.status == 'candidate' }}")
+        self.assertEqual(jobs["publish"]["if"], "${{ inputs.publishDraft && needs.validate.outputs.status == 'validated' }}")
+        for name, job in jobs.items():
+            self.assertNotIn("env", job)
+            self.assertNotIn("continue-on-error", job)
+            self.assertEqual(job["runs-on"], "windows-latest" if name == "publish" else "windows-11-arm")
+            self.assertLessEqual(job["timeout-minutes"], 45)
+            if name != "agent":
+                self.assertNotIn("permissions", job)
+            for step in job["steps"]:
+                if "uses" in step:
+                    self.assertRegex(step["uses"], r"^actions/[a-z-]+@[0-9a-f]{40}$")
+                if step.get("uses", "").startswith("actions/checkout@"):
+                    self.assertIs(step["with"]["persist-credentials"], False)
+                if step.get("uses", "").startswith("actions/download-artifact@"):
+                    self.assertIn("${{ github.run_id }}-${{ github.run_attempt }}", step["with"]["name"])
+                    self.assertNotIn("run-id", step["with"])
+                if step.get("uses", "").startswith("actions/upload-artifact@"):
+                    self.assertEqual(step["if"], "${{ always() }}")
+                    self.assertEqual(step["with"]["retention-days"], 7)
+                    self.assertEqual(step["with"]["if-no-files-found"], "error")
+                if "run" in step:
+                    self.assertNotIn("${{", step["run"])
+                env = step.get("env", {})
+                if name == "agent" and step.get("id") == "repair":
+                    self.assertEqual(env["GITHUB_TOKEN"], "${{ github.token }}")
+                else:
+                    self.assertNotIn("GITHUB_TOKEN", env)
+                if name != "publish":
+                    self.assertNotIn("secrets.", str(step))
+                elif "run" in step:
+                    self.assertEqual(env["OPENARM_GITHUB_TOKEN"], "${{ secrets.OPENARM_GITHUB_TOKEN }}")
+                    self.assertIn("Publish-GitHubRepair.ps1", step["run"])
+        self.assertNotIn("Invoke-NativeLoop", str(jobs["agent"]))
+        self.assertNotIn("copilot -p", str(jobs["publish"]))
+
+    def test_repair_tasks_do_not_invent_a_hermes_fix(self):
+        tasks = ROOT / "targets" / "github"
+        hermes = json.loads((tasks / "hermes-browser-77488.json").read_text())
+        self.assertEqual(hermes["mode"], "diagnose")
+        self.assertEqual(hermes["allowedFiles"], [])
+        self.assertRegex(hermes["commit"], r"^[a-f0-9]{40}$")
+        self.assertIn("#77093", hermes["context"])
+        self.assertNotIn("generator", hermes)
+        smoke = json.loads((tasks / "cmake-smoke.json").read_text())
+        self.assertEqual(smoke["repository"], "self")
+        self.assertEqual(smoke["fork"], "")
+        self.assertEqual(smoke["allowedFiles"], ["main.cpp"])
+
     def test_human_help_issue_behavior(self):
         workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")
         script = workflow["jobs"]["human-help"]["steps"][0]["with"]["script"]
