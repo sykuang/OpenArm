@@ -44,8 +44,15 @@ try {
             $report.reason = $baseline.reason
             $context = "$($task.context)`nIssue: $($task.issue)`nBaseline status: $($report.status)`n$($baseline.reason)"
             if ($repairable) {
-                $logPath = if ($isWrapper) { 'result.json' } else { $baseline.attempts[-1].checks[-1].log }
-                $log = Get-Content -LiteralPath (Resolve-ChildPath (Join-Path $Output 'baseline-result') $logPath) -Raw
+                $log = if ($isWrapper) {
+                    @{
+                        host = $baseline.host; checks = $baseline.checks
+                        launches = @($baseline.launches | Select-Object name, exitCode, passed, error, stderr)
+                    } | ConvertTo-Json -Depth 10
+                } else {
+                    $logPath = $baseline.attempts[-1].checks[-1].log
+                    Get-Content -LiteralPath (Resolve-ChildPath (Join-Path $Output 'baseline-result') $logPath) -Raw
+                }
                 $context += "`nBaseline evidence:`n" + $log.Substring([Math]::Max(0, $log.Length - 16000))
                 $source = Join-Path $Output 'editable'
                 $null = New-Item -ItemType Directory -Path $source
