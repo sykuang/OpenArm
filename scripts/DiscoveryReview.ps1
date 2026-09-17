@@ -254,10 +254,11 @@ function Get-ReviewPromptRepository([hashtable] $Repository, [int] $Depth = 0) {
         coverage = $Repository.coverage; documents = @(); dependency = $null
     }
     foreach ($document in $Repository.documents) {
+        $passages = @(Get-ReviewPassages $document.content.text)
         $result.documents += @{
             id = $document.id; repository = $document.repository; kind = $document.kind; url = $document.url
             details = $document.details; excerptTruncated = $document.content.truncated
-            passages = @(Get-ReviewPassages $document.content.text)
+            passageCount = $passages.Count; passages = $passages
         }
     }
     if ($Repository.dependency) { $result.dependency = Get-ReviewPromptRepository $Repository.dependency ($Depth + 1) }
@@ -305,6 +306,10 @@ Return exactly one entry per REQUESTED_REPOSITORIES name, in any order, using th
 For a dependency use {"name":"package or component display name","repository":"owner/repo or null"}
 instead of null. The display name must be nonblank, at most 151 characters, with no control characters.
 Use 0-5 citations. Select the exact integer number of a supplied passage in that document.
+Each document's passageCount is the maximum valid passage number, not a suggested reference.
+Never count passages yourself or infer a number from a different document. Copy a number shown
+beside the actual supporting text, and check it is between 1 and that document's passageCount.
+For unknown assessments use an empty citations array; explain the evidence limitation in reason.
 Do NOT generate, paraphrase or copy quotes: the caller copies the chosen source passage verbatim.
 For reported_missing_native_support cite an explicit missing/unsupported/degraded Windows Arm64
 native-support statement. Cite independent corroboration when available; otherwise say the report
@@ -317,6 +322,8 @@ If support is merely unknown, return unknown rather than inventing a porting can
 Do not infer dependency ownership unless the supplied evidence identifies it.
 Focus question (if any): $Question
 Before returning, check that your fullName set is exactly $requestedNames.
+Check EVERY citation against its own document's listed passage numbers. An out-of-range reference
+invalidates the entire batch. Omit a citation you cannot locate exactly rather than guessing.
 DATA:
 $data
 "@

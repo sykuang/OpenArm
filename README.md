@@ -145,6 +145,8 @@ enough. Findings distinguish project distribution, dependency and feature gaps
 from existing-support bugs, emulation and unknown support. The final report keeps
 at most one eligible candidate per source track; all assessments remain visible.
 Copilot selects numbered passages rather than generating quote text. The validator
+supplies each document's passage count and rejects out-of-range references; unknown
+assessments are prompted to omit citations rather than guess a source location. It
 copies those bounded passages directly from the collected source, preserving
 Markdown and Unicode and preventing paraphrases from becoming purported quotations.
 Single-source reports remain visible as `uncorroborated_report`, with a review

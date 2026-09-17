@@ -193,6 +193,10 @@ try {
     Assert ($hermes.scope -eq 'focus' -and $hermes.tracks.Count -eq 0 -and $hermes.nativeSupport -eq 'native_distribution_available' -and
         $hermes.dependency.fullName -eq 'sindresorhus/get-windows' -and
         ($hermes.documents | Where-Object kind -eq 'pull_request').details.state -eq 'MERGED') 'A native parent package does not erase the dependency, and merged workaround bodies are preserved'
+    $promptRepository = Get-ReviewPromptRepository $hermes
+    $promptDocuments = @($promptRepository.documents) + @($promptRepository.dependency.documents)
+    Assert (@($promptDocuments | Where-Object { $_.passageCount -ne $_.passages.Count -or
+        @($_.passages | Where-Object number -lt 1).Count }).Count -eq 0) 'Every root and dependency document explicitly supplies its own citation range'
     $focusReview = Run-Review 'reviewed-focus' 'Agent' $focusPrepared.output
     Assert (-not $focusReview.error -and $focusReview.report.assessedCount -eq 101 -and
         $global:ReviewMock.agentCalls.Count -eq 11 -and $global:ReviewMock.agentCalls[0].count -eq 1) "The named focus receives priority content review without changing the ranked 100: $($focusReview.error)"
