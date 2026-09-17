@@ -233,6 +233,14 @@ A passing current wheel does not prove that older wheels or other workflows work
 an old-only failure is not a reason to invent a new source fix. A reproduced
 current failure still needs dependency ownership and a reviewed source-build
 adapter before the Copilot repair workflow can generate a genuine native draft.
+
+The [native trial on September 17, 2026](https://github.com/sykuang/OpenArm/actions/runs/35211701652)
+installed both pinned wheels but stopped **before running the inverse cases**:
+the Python 3.12.10 Arm64 toolcache package contains `vcruntime140_1.dll` with PE
+machine **0x8664**, while the other 65 inventoried Python/NumPy binaries are
+**0xAA64**. The strict package gate remains unchanged. This is a runtime-package
+inventory blocker, not a reproduced NumPy crash or evidence that the Python
+process used emulation. No NumPy fix or native draft PR resulted from this trial.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
