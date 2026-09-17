@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "repositories": [
+    {
+      "fullName": "numpy/numpy",
+      "channels": [{ "provider": "pypi", "package": "numpy" }]
+    },
+    {
+      "fullName": "grpc/grpc",
+      "channels": [{ "provider": "pypi", "package": "grpcio" }]
+    },
+    {
+      "fullName": "ninja-build/ninja",
+      "channels": [{ "provider": "github" }]
+    },
+    {
+      "fullName": "ccache/ccache",
+      "channels": [{ "provider": "github" }]
+    }
+  ]
+}

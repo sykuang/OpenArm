@@ -181,6 +181,7 @@ class PipelineChecks(unittest.TestCase):
         self.assertRegex(steps[0]["uses"], r"^actions/checkout@[0-9a-f]{40}$")
         self.assertEqual(steps[0]["with"], {"persist-credentials": False})
         discover, manual = steps[4:6]
+        self.assertIn("missing native Windows Arm64", discover["name"])
         self.assertEqual(discover["if"], "${{ inputs.sourceRepositoryUrl == '' }}")
         self.assertEqual(manual["if"], "${{ inputs.sourceRepositoryUrl != '' }}")
         for step, script in ((discover, "Find-Arm64Candidate.ps1"), (manual, "Invoke-GitHubTrial.ps1")):
@@ -210,6 +211,9 @@ class PipelineChecks(unittest.TestCase):
             "if-no-files-found": "error",
             "retention-days": 7,
         })
+        channels = json.loads((ROOT / "targets" / "discovery" / "distribution-channels.json").read_text())
+        numpy = next(item for item in channels["repositories"] if item["fullName"] == "numpy/numpy")
+        self.assertIn({"provider": "pypi", "package": "numpy"}, numpy["channels"])
 
     def test_trial_installs_native_copilot_without_invoking_ai(self):
         workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")

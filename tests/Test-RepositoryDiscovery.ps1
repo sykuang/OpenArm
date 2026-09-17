@@ -6,7 +6,8 @@ $root = Join-Path $repo ".local\repository-discovery-$([guid]::NewGuid())"
 $fixture = "$root\fixture"
 $null = New-Item -ItemType Directory -Path "$fixture\scripts", "$fixture\targets\discovery"
 Copy-Item -LiteralPath "$repo\scripts\Common.ps1", "$repo\scripts\ReleaseEvidence.ps1",
-    "$repo\scripts\RepositorySources.ps1", "$repo\scripts\Find-Arm64Candidate.ps1" -Destination "$fixture\scripts"
+    "$repo\scripts\RepositorySources.ps1", "$repo\scripts\DistributionEvidence.ps1",
+    "$repo\scripts\Find-Arm64Candidate.ps1" -Destination "$fixture\scripts"
 $savedEnvironment = @{}
 foreach ($name in 'OPENARM_GITHUB_DISCOVERY_TOKEN', 'OPENARM_GITHUB_TOKEN', 'OPENARM_GITHUB_TRIAL_CREATE', 'OPENARM_DISCOVERY_TRACK') {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -26,9 +27,9 @@ function New-Issue([int] $RepoNumber, [string] $Title, [int] $Number = 1) {
 function New-Release([array] $Assets = @()) {
     @{ tag_name = 'v1'; published_at = '2026-09-16T00:00:00Z'; draft = $false; prerelease = $false; assets = $Assets }
 }
-function New-ReleaseAsset([string] $Name, [long] $Size = 256) {
+function New-ReleaseAsset([string] $Name, [long] $Size = 256, [int] $RepoNumber = 2) {
     @{ name = $Name; size = $Size; state = 'uploaded'
-        browser_download_url = "https://github.com/owner/repo2/releases/download/v1/$([uri]::EscapeDataString($Name))" }
+        browser_download_url = "https://github.com/owner/repo$RepoNumber/releases/download/v1/$([uri]::EscapeDataString($Name))" }
 }
 function New-LinkedPullRequest([string] $State = 'OPEN', [int] $Number = 42, [string] $Repository = 'owner/repo2') {
     @{ number = $Number; url = "https://github.com/$Repository/pull/$Number"; state = $State
@@ -41,6 +42,10 @@ function Reset-Mock {
         schemaVersion = 1
         repositories = @(11..20 | ForEach-Object { @{ fullName = "owner/repo$_"; category = 'library'; reason = "Shared native dependency $_" } })
     }
+    Write-Json "$fixture\targets\discovery\distribution-channels.json" @{
+        schemaVersion = 1
+        repositories = @(1..20 | ForEach-Object { @{ fullName = "owner/repo$_"; channels = @(@{ provider = 'github' }) } })
+    }
     $global:DiscoveryMock = @{
         calls = [Collections.Generic.List[object]]::new()
         sleeps = [Collections.Generic.List[int]]::new()
@@ -52,11 +57,17 @@ function Reset-Mock {
         issues = @{
             'repo1' = @(New-Issue 1 'Windows ARM64 already works: documentation')
             'repo2' = @(New-Issue 2 'Add Windows ARM64 support')
-            'repo3' = @(New-Issue 3 'Build fails on Windows ARM64')
-            'repo11' = @(New-Issue 11 'Windows ARM64 build fails')
+            'repo3' = @(New-Issue 3 'Missing Windows ARM64 binaries')
+            'repo11' = @(New-Issue 11 'Provide native Windows ARM64 wheels')
         }
         trendingReads = 0; trendingHtml = $null; trendingError = $false
-        releases = @{}; downloads = 0; assetMachine = 0xAA64; assetFailure = $false
+        releases = @{
+            repo2 = (New-Release @(New-ReleaseAsset 'app-win-x64.exe'))
+            repo3 = (New-Release @(New-ReleaseAsset 'app-win-x64.exe' -RepoNumber 3))
+            repo11 = (New-Release @(New-ReleaseAsset 'app-win-x64.exe' -RepoNumber 11))
+        }
+        downloads = 0; assetMachine = 0x8664; assetMachines = @{}; assetFailure = $false
+        registry = @{}; registryReads = [Collections.Generic.List[string]]::new(); registryError = $false
         issueTotal = @{}; incompleteAt = 0; failAt = 0; failStatus = 403
         throwAt = 0; malformedAt = 0
         linkedPullRequests = @{}; truncatedFixes = @(); graphError = ''; graphQueries = @()
@@ -83,11 +94,23 @@ function global:Mock-DiscoveryBytes {
     [BitConverter]::GetBytes([uint16]0x5A4D).CopyTo($bytes, 0)
     [BitConverter]::GetBytes([int]128).CopyTo($bytes, 0x3C)
     [BitConverter]::GetBytes([uint32]0x4550).CopyTo($bytes, 128)
-    [BitConverter]::GetBytes([uint16]$m.assetMachine).CopyTo($bytes, 132)
+    $repositoryName = ([uri]$Uri).AbsolutePath.Split('/')[2]
+    $machine = if ($m.assetMachines.ContainsKey($repositoryName)) { $m.assetMachines[$repositoryName] } else { $m.assetMachine }
+    [BitConverter]::GetBytes([uint16]$machine).CopyTo($bytes, 132)
     $Budget.remainingBytes -= $bytes.Length
     return ,$bytes
 }
 Set-Alias -Name Receive-ReleaseBytes -Value Mock-DiscoveryBytes -Scope Global
+function global:Mock-DistributionMetadata {
+    param($Uri, $Request)
+    $m = $global:DiscoveryMock
+    $m.registryReads.Add([string]$Uri)
+    if ($m.registryError) { throw 'Package metadata request failed (HTTP 403); no retry was attempted.' }
+    if (-not $m.registry.ContainsKey([string]$Uri)) { $Request.httpStatus = 404; return $null }
+    $Request.httpStatus = 200
+    $m.registry[[string]$Uri]
+}
+Set-Alias -Name Receive-DistributionMetadata -Value Mock-DistributionMetadata -Scope Global
 function global:Invoke-RestMethod {
     param($Method, $Uri, $Headers, $TimeoutSec, $MaximumRedirection, $ContentType, $Body,
         [switch] $SkipHttpErrorCheck, $StatusCodeVariable, $ErrorAction)
@@ -188,7 +211,9 @@ try {
     Assert ($global:DiscoveryMock.calls[0].route -eq '/repos/owner/repo1' -and $r.sources.Count -eq 2) 'Repository identity comes from the two reviewed sources, not an all-time-star search'
     Assert (($r.repositories.fullName -join ',') -eq ((1..20 | ForEach-Object { "owner/repo$_" }) -join ',')) 'Displayed Trending order and curated Foundational order are preserved independently'
     Assert ($r.repositories[0].assessment -eq 'needs_review' -and $r.repositories[3].assessment -eq 'no_matching_open_issue') 'Incidental mentions and no matches do not imply lack of support'
-    Assert ($r.repositories[1].assessment -eq 'reported_arm64_work' -and $r.repositories[2].assessment -eq 'reported_arm64_work') 'Explicit support requests and build failures are recognized'
+    Assert ($r.repositories[1].assessment -eq 'reported_missing_native_support' -and $r.repositories[2].assessment -eq 'reported_missing_native_support') 'Only explicit missing-support requests are eligible'
+    Assert ($r.schemaVersion -eq 4 -and $r.selectionMode -eq 'missing_native_support_only' -and
+        $r.distributionAssessedCount -eq 20 -and $r.repositories[1].nativeSupport.status -eq 'missing_in_reviewed_channels') 'Missing-only selection requires completed reviewed distribution evidence'
     Assert ($r.recommendations.Count -eq 2 -and $r.recommendations[0].fullName -eq 'owner/repo2' -and
         $r.recommendations[1].fullName -eq 'owner/repo11') 'One issue-backed candidate per track is selected'
     Assert ($r.nativeVerified -eq $false -and @($r.recommendations | Where-Object { -not $_.provisional }).Count -eq 0) 'Recommendations are explicitly provisional, never native proof'
@@ -240,7 +265,7 @@ try {
             $markdown.Contains($evidence.status)) 'Readable report explains upstream fix exclusions with links'
     }
     Reset-Mock
-    $global:DiscoveryMock.issues['repo2'] += New-Issue 2 'Another Windows ARM64 build fails' 2
+    $global:DiscoveryMock.issues['repo2'] += New-Issue 2 'Provide native Windows ARM64 packages' 2
     $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(New-LinkedPullRequest)
     $run = Run-Discovery 'other-issue'
     Assert (-not $run.error -and $run.report.recommendations[0].issueUrl -eq 'https://github.com/owner/repo2/issues/2') 'An unrelated unclaimed issue in the same repository remains eligible'
@@ -319,7 +344,8 @@ try {
     Reset-Mock
     $global:DiscoveryMock.issues = @{}
     foreach ($n in 1..20) {
-        $global:DiscoveryMock.issues["repo$n"] = @(1..5 | ForEach-Object { New-Issue $n "Windows ARM64 build fails $_" $_ })
+        $global:DiscoveryMock.issues["repo$n"] = @(1..5 | ForEach-Object { New-Issue $n "Add Windows ARM64 support $_" $_ })
+        $global:DiscoveryMock.releases["repo$n"] = New-Release @(New-ReleaseAsset 'app-win-x64.exe' -RepoNumber $n)
     }
     $run = Run-Discovery 'max-linked-issues'
     Assert (-not $run.error -and $run.report.upstreamFixReview.assessedCount -eq 100 -and
@@ -358,6 +384,22 @@ try {
         Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.sources[1].status -eq 'error' -and
             $global:DiscoveryMock.calls.Count -eq 0) "Invalid foundational catalog $case cannot drive API access"
     }
+    foreach ($case in 'duplicate', 'bad-path', 'empty-channels', 'unreviewed-provider', 'bad-pypi', 'bad-npm') {
+        Reset-Mock
+        $catalog = Read-Json "$fixture\targets\discovery\distribution-channels.json"
+        switch ($case) {
+            'duplicate' { $catalog.repositories += $catalog.repositories[0] }
+            'bad-path' { $catalog.repositories[0].fullName = 'owner/../../other' }
+            'empty-channels' { $catalog.repositories[0].channels = @() }
+            'unreviewed-provider' { $catalog.repositories[0].channels = @(@{ provider = 'untrusted' }) }
+            'bad-pypi' { $catalog.repositories[0].channels = @(@{ provider = 'pypi'; package = '../numpy' }) }
+            'bad-npm' { $catalog.repositories[0].channels = @(@{ provider = 'npm'; package = 'https://evil.invalid' }) }
+        }
+        Write-Json "$fixture\targets\discovery\distribution-channels.json" $catalog
+        $run = Run-Discovery "invalid-channel-$case"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and
+            $global:DiscoveryMock.calls.Count -eq 0 -and $global:DiscoveryMock.registryReads.Count -eq 0) "Invalid channel review cannot authorize network access or recommendations: $case"
+    }
     Reset-Mock
     $run = Run-Discovery 'invalid-track' @{ Track = 'unreviewed' }
     Assert ($run.error -and $global:DiscoveryMock.calls.Count -eq 0 -and $global:DiscoveryMock.trendingReads -eq 0) 'Unreviewed discovery tracks fail before network access'
@@ -370,22 +412,17 @@ try {
         $size = if ($case -eq 'empty') { 0 } else { 256 }
         $assets = @(if ($case -ne 'no-assets') { New-ReleaseAsset $name $size })
         $global:DiscoveryMock.releases['repo2'] = New-Release $assets
-        if ($case -in 'x64', 'mislabeled') { $global:DiscoveryMock.assetMachine = 0x8664 }
+        if ($case -eq 'arm64') { $global:DiscoveryMock.assetMachines['repo2'] = 0xAA64 }
         $run = Run-Discovery "release-$case"
-        $expected = switch ($case) {
-            'x64' { 'investigate_possible_distribution_gap' }
-            { $_ -in 'empty', 'mislabeled' } { 'investigate_release_artifact' }
-            'no-assets' { 'investigate_reported_arm64_work' }
-            default { 'investigate_existing_arm64_distribution' }
-        }
-        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo2' -and
-            $run.report.recommendations[0].workKind -eq $expected) "Release evidence changes the investigation, not the independent track ranking: $case ($($run.error))"
+        $expected = if ($case -eq 'x64') { 'owner/repo2' } else { 'owner/repo3' }
+        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq $expected -and
+            $run.report.recommendations[0].workKind -eq 'investigate_missing_native_support') "Existing native advertisements, artifact bugs and unknown releases cannot be selected as missing: $case ($($run.error))"
         $release = $run.report.repositories[1].release
         Assert ($release.tag -eq 'v1' -and ([DateTimeOffset]$release.publishedAt).ToUniversalTime().ToString('o') -like '2026-09-16T00:00:00*' -and
             $release.url -eq 'https://github.com/owner/repo2/releases/tag/v1') 'Latest-release provenance is durable'
         if ($case -eq 'arm64') {
             Assert ($release.windowsArm64 -eq 'pe_header_found' -and $release.assets[0].binaries[0].machine -eq '0xAA64' -and
-                $global:DiscoveryMock.downloads -eq 1) 'Public discovery inspects actual binary headers'
+                $global:DiscoveryMock.downloads -eq 3) 'Public discovery inspects actual binary headers'
             $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
             Assert ($markdown -like '*Release binary evidence*' -and $markdown -like '*0xAA64*' -and $markdown -like '*app-win-arm64.exe*') 'Markdown exposes release and binary evidence, not just JSON'
         }
@@ -406,7 +443,7 @@ try {
         Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0 -and
             $run.report.assessedCount -eq 20 -and $run.report.releaseAssessedCount -eq 1 -and
             $global:DiscoveryMock.calls.Count -eq 42) "Release failure retains issue progress but prevents premature recommendations: $case"
-        Assert ($run.report.repositories[1].assessment -eq 'reported_arm64_work' -and
+        Assert ($run.report.repositories[1].assessment -eq 'reported_missing_native_support' -and
             $run.report.repositories[1].release.status -eq 'error') 'Release errors do not erase completed issue assessments'
         if ($case -eq 'download') {
             Assert ($run.report.repositories[1].release.assets[0].inspection -eq 'download_error' -and
@@ -447,6 +484,74 @@ try {
         $run = Run-Discovery "mention-$([guid]::NewGuid())"
         Assert (-not $run.error -and $run.report.recommendations.Count -eq 0 -and
             $run.report.repositories[0].assessment -eq 'needs_review') "Not absence proof: $title"
+    }
+
+    foreach ($title in 'Build fails on Windows ARM64', 'BUG: linalg.inv crashing on windows arm64',
+        'BUG: Windows-ARM64 tests failing in linalg.cond', 'Windows ARM64 Release crash',
+        'Fix Windows ARM64 build errors', 'Windows ARM64 performance regression') {
+        Reset-Mock
+        $global:DiscoveryMock.issues = @{ repo2 = @(New-Issue 2 $title) }
+        $run = Run-Discovery "existing-bug-$([guid]::NewGuid())"
+        Assert (-not $run.error -and $run.report.recommendations.Count -eq 0 -and
+            $run.report.repositories[1].assessment -eq 'existing_support_bug' -and
+            $global:DiscoveryMock.graphQueries.Count -eq 0) "A native-support bug is not a missing-support candidate: $title"
+    }
+    Reset-Mock
+    $titles = @('Missing Windows ARM64 binary', 'No Windows ARM64 wheel available',
+        'Windows ARM64 is not supported', 'Windows ARM64 installer unavailable', 'Port to Windows on Arm')
+    $global:DiscoveryMock.issues['repo2'] = @(for ($i = 0; $i -lt $titles.Count; $i++) { New-Issue 2 $titles[$i] ($i + 1) })
+    $run = Run-Discovery 'explicit-missing-wording'
+    Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo2' -and
+        @($run.report.repositories[1].issues | Where-Object classification -ne 'reported_missing_native_support').Count -eq 0) 'Explicit missing support, singular binary/wheel/installer and port requests remain eligible with complete channel evidence'
+    foreach ($case in 'unreviewed', 'no-release', 'uninspected', 'unlabeled', 'uninspected-shadow', 'no-windows-assets') {
+        Reset-Mock
+        $global:DiscoveryMock.issues = @{ repo2 = @(New-Issue 2 'Add Windows ARM64 support') }
+        switch ($case) {
+            'unreviewed' {
+                $catalog = Read-Json "$fixture\targets\discovery\distribution-channels.json"
+                $catalog.repositories = @($catalog.repositories | Where-Object fullName -ne 'owner/repo2')
+                Write-Json "$fixture\targets\discovery\distribution-channels.json" $catalog
+            }
+            'no-release' { $global:DiscoveryMock.releases.Remove('repo2') }
+            'uninspected' { $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app-win-x64.msi') }
+            'unlabeled' { $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app.exe') }
+            'uninspected-shadow' { $global:DiscoveryMock.releases['repo2'] = New-Release @((New-ReleaseAsset 'app-win-x64.exe'), (New-ReleaseAsset 'shadow-win-x64.msi')) }
+            'no-windows-assets' { $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app-linux-x64.tar.gz') }
+        }
+        $run = Run-Discovery "unknown-support-$case"
+        Assert (-not $run.error -and $run.report.recommendations.Count -eq 0 -and
+            $run.report.repositories[1].nativeSupport.status -eq 'unverified') "Unknown support cannot be converted into missing support: $case"
+    }
+    foreach ($case in 'arm64', 'portable', 'x64', 'not-found', 'http', 'wrong-package') {
+        Reset-Mock
+        $catalog = Read-Json "$fixture\targets\discovery\distribution-channels.json"
+        $catalog.repositories[1].channels = @(@{ provider = 'pypi'; package = 'numpy' })
+        Write-Json "$fixture\targets\discovery\distribution-channels.json" $catalog
+        $global:DiscoveryMock.releases.Remove('repo2')
+        $global:DiscoveryMock.issues = @{ repo2 = @(New-Issue 2 'Add Windows ARM64 support') }
+        $filename = switch ($case) {
+            'portable' { 'numpy-2.5.3-py3-none-any.whl' }
+            'x64' { 'numpy-2.5.3-cp312-cp312-win_amd64.whl' }
+            default { 'numpy-2.5.3-cp312-cp312-win_arm64.whl' }
+        }
+        if ($case -ne 'not-found') {
+            $global:DiscoveryMock.registry['https://pypi.org/pypi/numpy/json'] = @{
+                info = @{ name = $(if ($case -eq 'wrong-package') { 'other' } else { 'numpy' }); version = '2.5.3' }
+                urls = @(@{ filename = $filename; packagetype = 'bdist_wheel'; yanked = $false; size = 100 })
+            }
+        }
+        if ($case -eq 'http') { $global:DiscoveryMock.registryError = $true }
+        $run = Run-Discovery "pypi-support-$case"
+        if ($case -in 'http', 'wrong-package') {
+            Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0) 'Registry failures do not authorize missing-support recommendations'
+        } else {
+            Assert (-not $run.error -and $run.report.recommendations.Count -eq $(if ($case -eq 'x64') { 1 } else { 0 })) "Official PyPI distributions override stale GitHub requests and missing GitHub assets: $case ($($run.error))"
+            if ($case -eq 'arm64') {
+                Assert ($run.report.repositories[1].nativeSupport.status -eq 'native_distribution_available' -and
+                    $run.report.repositories[1].nativeSupport.channels[1].examples[0] -eq $filename) 'NumPy win_arm64 wheels are explicit exclusion evidence, not a new porting opportunity'
+            }
+        }
+        Assert ($global:DiscoveryMock.registryReads.Count -eq 1) 'The official registry read is bounded and never retried'
     }
 
     Reset-Mock
@@ -532,6 +637,8 @@ try {
     Remove-Item Function:\Mock-DiscoveryTrending -ErrorAction SilentlyContinue
     Remove-Item Alias:\Receive-ReleaseBytes -ErrorAction SilentlyContinue
     Remove-Item Function:\Mock-DiscoveryBytes -ErrorAction SilentlyContinue
+    Remove-Item Alias:\Receive-DistributionMetadata -ErrorAction SilentlyContinue
+    Remove-Item Function:\Mock-DistributionMetadata -ErrorAction SilentlyContinue
     Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
     Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
     Remove-Variable DiscoveryMock -Scope Global -ErrorAction SilentlyContinue

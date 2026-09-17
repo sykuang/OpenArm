@@ -90,25 +90,45 @@ curated priority, not a measured dependency ranking or proof of a native gap.
 There is **no minimum lifetime-star threshold**.
 
 The tracks are ranked separately and each can recommend one provisional candidate
-with an explicit native support request or failure report. Overlapping repositories
+with **explicit missing native Windows Arm64 support**, not an ordinary crash,
+regression, performance problem or build failure in existing support. Overlapping repositories
 are assessed once and retain both source ranks; if both tracks recommend the same
 repository, that is one repair candidate, not two separate porting tasks.
 All selected repositories must be public, non-archived and non-forks. The scan
-checks bounded issue evidence and latest stable GitHub release assets. Download the
+checks bounded issue evidence, latest stable GitHub release assets and reviewed
+official package-registry channels. Download the
 `github-trial-<run-id>-<attempt>` artifact from the workflow run:
 **`discovery.md`** contains both source rankings, rationales, issue links and binary
-evidence. **`discovery.json`** is now **schema version 3**: `sources` records source
-provenance and HTML/catalog hashes; `recommendations` is an array with at most one
-entry per track, replacing the old singular `recommendation`. Assessments, request
-outcomes, timestamps, inspection limits and failures remain explicit.
+evidence. **`discovery.json`** is now **schema version 4**, with
+`selectionMode: missing_native_support_only`, per-repository `nativeSupport`
+evidence and a distribution-catalog hash. `sources` retains source provenance;
+`recommendations` remains an array with at most one entry per track. Assessments,
+request outcomes, timestamps, inspection limits and failures remain explicit.
+
+**Existing native distributions, ordinary native-support bugs, and unknown support
+are excluded from recommendations.** `targets\discovery\distribution-channels.json`
+records reviewed official channels; registry package names are not guessed from
+repository names. It currently maps NumPy and gRPC to their official PyPI packages,
+and Ninja/ccache to GitHub releases. Other repositories stay visible in the source
+inventory, but cannot be recommended as missing until their relevant distribution
+channels are reviewed. This deliberately trades recall for avoiding false porting
+tasks; an unreviewed Trending project is not assumed to distribute only on GitHub.
+
+Every recommendation requires an explicit missing-support issue, completed
+reviewed-channel evidence corroborating that gap, and a clear upstream-work check.
+Any observed/advertised Windows Arm64 distribution vetoes a new-port recommendation,
+including one found on GitHub outside the configured registry channel. NumPy's
+`win_arm64` PyPI wheels therefore exclude it even if GitHub has only source assets
+or an old request still asks for Windows Arm64 support. An existing artifact with
+a crash, bad label or empty payload belongs to separate bug triage, not this queue.
 
 Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
 variables > Actions > New repository secret**, using a token issued for
 **GitHub.com** with public read access only; no write
 permissions are needed. Without it, **GitHub Actions uses its existing read-only
 job token** for public discovery, avoiding reliance on the shared runner's
-anonymous quota. The token is passed only to API reads in the discovery step;
-Trending and release asset downloads remain anonymous. Local runs without this environment variable still
+anonymous quota. The token is passed only to GitHub API reads in the discovery step;
+Trending, registry metadata and release asset downloads remain anonymous. Local runs without this environment variable still
 use anonymous public REST reads, but cannot recommend candidates because the
 linked-upstream-fix check requires GraphQL authentication.
 It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
@@ -117,12 +137,19 @@ Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 can still apply. HTTP errors, rate limits and incomplete responses fail visibly,
 retain partial reports and make **no recommendation**; requests are not retried.
 
-The bounded scan makes **at most 60 API GET requests**: repository metadata, one
+The bounded scan makes **at most 60 GitHub API GET requests**: repository metadata, one
 issue search and one latest-release read for each of at most twenty unique
 repositories. The issue query remains `repo:OWNER/REPO is:issue is:open Windows
 ARM64 in:title,body`, inspecting up to five most recently updated matches.
-After issue and release reads complete, **one authenticated GraphQL query POST**
-checks `closedByPullRequestsReferences` for every title-eligible issue (at most
+Configured PyPI/npm channels add at most **40 anonymous metadata GETs** (at most
+one per provider per repository), without cookies, credentials or redirects.
+Each response is bounded to **16 MiB and 30 seconds**; no new registry read starts
+after 180 seconds in the distribution phase. A registry 404 is unverified, not
+proof of missing support; other HTTP/transport/malformed-response failures stop
+the scan visibly. No registry package is downloaded, installed or executed.
+After issue, release and distribution reads complete, **one authenticated GraphQL query POST**
+checks `closedByPullRequestsReferences` for every issue passing the missing-support
+and distribution gates (at most
 100 issues), with up to ten linked PRs per issue. The same query searches each
 repository for up to five PRs whose body references that issue number
 (`repo:OWNER/REPO is:pr NUMBER in:body sort:updated-desc`); both have explicit
@@ -137,14 +164,32 @@ The core API has a separate anonymous limit (normally 60 requests/hour, shared b
 No language filter is applied. GitHub metadata and search are not a consistent
 global snapshot; documentation repositories and inapplicable issue matches may remain.
 
-Assessments are `reported_arm64_work`, `needs_review` or
+Issue assessments are `reported_missing_native_support`, `existing_support_bug`, `needs_review` or
 `no_matching_open_issue` (plus `not_assessed`/`error` on interrupted scans).
 Matching totals and the five-title limit are explicit. **A recommendation is
-provisional, not proof that the repository lacks Arm64 support.** Existing support
-can have open bugs. Missing matches or documentation prove nothing; aliases,
+provisional, not proof that the repository lacks Arm64 support.** The issue may
+still be stale, and native source builds may exist beyond the reviewed distribution
+scope. Missing matches or documentation prove nothing; aliases,
 non-English reports, closed issues and older matches may be missed. A complete
 scan may honestly find no candidate. Review the linked report and reproduce it
 on native Windows Arm64 before choosing build commands or writing a port.
+
+`nativeSupport.status` is `native_distribution_available` for observed/advertised
+Windows Arm64 availability, `not_a_native_port_candidate` for a portable
+distribution, `unverified` for missing/incomplete channel knowledge, or
+`missing_in_reviewed_channels` when the complete reviewed inventory corroborates
+a missing distribution. Only the last status can qualify, and never without an
+explicit missing-support issue. Native advertisements are conservative exclusions,
+not architecture or execution certification.
+
+PyPI inspection considers at most **500 files in the current release**, excluding
+yanked/empty files. A `win_arm64.whl` excludes the project; a `none-any.whl` is
+portable rather than a native-port request. Other published wheels can corroborate
+a platform gap, while an empty/source-only/oversized inventory stays unverified.
+npm recognizes declared Windows Arm64 OS/CPU support or a named native optional
+package (at most **100 optional dependencies**). Only explicit Windows package
+CPU restrictions can corroborate absence: missing optional dependencies or
+generic JavaScript metadata alone remain unverified.
 
 Each issue's `upstreamFixReview` records linked PR URLs, repositories, states and
 truncation and whether evidence came from a `closing_link`, `body_reference` or
@@ -166,8 +211,9 @@ or search matches exceed the limits.
 
 Release evidence records the tag, publication time, release URL and up to **100
 assets from the latest-release response** (names, URLs and sizes). Drafts,
-prereleases, older releases and distribution through npm, PyPI, vendors or other
-channels are outside this scope. Filename platform/architecture hints are
+prereleases and older releases are outside this GitHub-release scope. Configured
+PyPI/npm channels are assessed separately; unreviewed vendor channels remain a
+selection blocker. Filename platform/architecture hints are
 **advertised, not verified**. Discovery downloads at most **3 assets per
 repository**, preferring Windows Arm64 names, then other Windows assets:
 
@@ -196,12 +242,13 @@ application launch. An x86 PE header may also belong to managed AnyCPU code,
 and an on-disk x64 machine field may belong to a hybrid ARM64X runtime DLL.
 Neither header alone proves that the measured application uses emulation.
 
-Each recommendation still requires an inspected matching issue and preserves
-its own source order. Its `workKind` directs review toward an artifact problem, an
-existing advertised/observed Arm64 distribution, a possible distribution gap,
-or an unresolved issue with unknown release evidence. Existing Arm64 binaries
-do not suppress a real reported bug; x64-only observations in this bounded
-sample do not establish that an entire repository lacks Arm64 support.
+Each recommendation preserves its own source order and uses
+`workKind: investigate_missing_native_support`. Existing-support bugs and unknown
+distributions are never substituted when no missing-support candidate qualifies.
+For a reviewed GitHub distribution channel, absence requires valid, completely
+inspected, explicitly x86/x64-labelled Windows artifacts; an uninspected installer,
+unknown/source archive, exhausted limit or truncated inventory stays unverified.
+An x64-only sample by itself does not establish that a repository lacks Arm64 support.
 Before selecting a repair, check existing fixes and identify the repository that
 owns the blocker. If several applications are blocked by one native dependency,
 repair that dependency once. Emulation-only reports require review, not an
@@ -220,9 +267,9 @@ Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are need
 `-Output` selects a new report directory and optional `-OutputRoot` bounds it.
 The default output is a unique `out\discovery-*` directory.
 
-### Reproduce the next native candidate before repairing
+### Historical native bug reproduction (not missing-support selection)
 
-The manual **Native NumPy inverse reproduction** workflow tests
+The separate manual **Native NumPy inverse reproduction** workflow tests
 [NumPy #29442](https://github.com/numpy/numpy/issues/29442) on `windows-11-arm`,
 using the report's native Python **3.12.10** and separate jobs for the reported
 **2.3.2** wheel and current **2.5.3** wheel. `targets\numpy-repro\*.txt` pins the
@@ -275,9 +322,11 @@ total, with native OS/process checks, all 23 wheel binaries per version at
 does not reproduce #29442 on these workers or establish that every environment
 is unaffected. The [updated discovery run](https://github.com/sykuang/OpenArm/actions/runs/35215842450)
 now skips #29442 because merged PRs #31649 and #31704 reference it as a possible
-fix; it recommends the separate #30089 condition-number report for investigation.
+fix; that historical selector recommended the separate #30089 condition-number report.
 Neither passing inverse tests nor existing upstream work justifies a new NumPy
 source-repair draft. The condition-number report is not covered by this fixture.
+Current missing-support-only discovery excludes both NumPy bug reports and does
+not dispatch this historical reproduction workflow.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).

@@ -8,6 +8,7 @@ param(
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\ReleaseEvidence.ps1"
 . "$PSScriptRoot\RepositorySources.ps1"
+. "$PSScriptRoot\DistributionEvidence.ps1"
 
 $Output = Resolve-OutputPath -Path $Output -Root $OutputRoot
 if (Test-Path -LiteralPath $Output) { throw 'Discovery output already exists; choose a new directory.' }
@@ -16,9 +17,11 @@ $token = $env:OPENARM_GITHUB_DISCOVERY_TOKEN
 if ([string]::IsNullOrWhiteSpace($token) -or $token.StartsWith('$(')) { $token = '' }
 $interval = if ($token) { 3 } else { 7 }
 $report = @{
-    schemaVersion = 3; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+    schemaVersion = 4; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
     completedAt = $null; apiHost = 'api.github.com'; authMode = $(if ($token) { 'token' } else { 'anonymous' })
     track = $Track; requestedCount = 0; maxRepositoriesPerTrack = 10
+    selectionMode = 'missing_native_support_only'; distributionCatalogSha256 = $null
+    distributionAssessedCount = 0
     assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendations = @(); error = $null
     sources = @()
     upstreamFixReview = @{
@@ -40,7 +43,11 @@ $report = @{
         'Tracks are ranked independently. Repositories appearing in both are assessed once and retain both source ranks; two recommendation slots can identify the same underlying repair candidate.'
         'There is no minimum lifetime-star threshold. Repository metadata, issue search and release reads are not a transactionally consistent snapshot.'
         'Each repository search uses open issues containing Windows AND ARM64 in title/body, newest updated first, at most five.'
-        'Only explicit Windows Arm64 support requests or failure wording in those titles can yield a provisional recommendation.'
+        'Only explicit requests/reports of missing native Windows Arm64 support or distributions can qualify. Crashes, regressions and ordinary build failures in existing support are not porting candidates.'
+        'A recommendation also requires a reviewed official distribution-channel profile, completed channel evidence showing the reported gap, and no advertised native or portable distribution. Unknown, unconfigured, truncated and uninspected support stays ineligible.'
+        'The tracked distribution-channel catalog identifies official GitHub, PyPI and npm channels; package names are never guessed. Unreviewed repositories remain visible but cannot become recommendations until their channels are reviewed.'
+        'Up to two anonymous registry GETs per repository inspect current PyPI/npm metadata, at most 16 MiB/30 seconds each; no redirects, credentials, package downloads, installs or execution. PyPI considers at most 500 current-release files; npm at most 100 optional dependencies.'
+        'Registry platform tags and GitHub asset names are advertised availability, not native execution proof. Existing native advertisements exclude porting candidates even if their binaries need separate bug investigation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
         'One authenticated read-only GraphQL query checks up to ten linked closing PRs and five repository PRs referencing the issue number in their body for each title-eligible issue (at most 100 issues). Open or merged work is skipped; closed unmerged PRs alone do not disqualify an issue.'
@@ -53,7 +60,7 @@ $report = @{
         'Filename hints are not verified architecture. PE headers identify individual EXE/DLL machine types, not working applications, signatures, complete integrity or native runtime compatibility.'
         'At most three assets per repository: EXE/DLL prefixes (64 KiB) or complete ZIPs (16 MiB). No archive paths are extracted; at most 512 entries and sixteen 64-KiB PE headers per ZIP.'
         'Downloads are anonymous HTTPS to GitHub/allowlisted release CDNs, at most three redirects, 30 seconds each, 128 MiB total and a 180-second release-phase budget; limit hits remain unverified.'
-        'An x64 observation without Arm64 in the inspected sample is only a possible distribution gap; existing Arm64 binaries can coexist with real reported bugs.'
+        'An x64 observation alone is not absence proof. Only a complete reviewed channel inventory plus an explicit missing-support report can form a provisional porting candidate; an older open request can still be stale.'
         'No source is cloned, built or executed. No fork, branch, PR, native target configuration or upstream change is created.'
     )
 }
@@ -71,6 +78,7 @@ function Save-Discovery {
     $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/$($report.requestedCount). Releases assessed: $($report.releaseAssessedCount)/$($report.requestedCount). Authentication: $($report.authMode).")
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
     $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. At most ten repositories per track; no lifetime-star threshold.")
+    $lines.Add("Selection: **missing native support only**. Distribution channels assessed: $($report.distributionAssessedCount)/$($report.requestedCount). Existing-support bugs and unverified support are excluded.")
     $lines.Add("Upstream fix review: $($report.upstreamFixReview.status); issues assessed: $($report.upstreamFixReview.assessedCount)/$($report.upstreamFixReview.requestedCount).")
     foreach ($source in $report.sources) {
         $lines.Add("- $($source.track): $($source.method); status $($source.status); source $(ConvertTo-MarkdownText $source.location).")
@@ -81,7 +89,7 @@ function Save-Discovery {
         $lines.Add("$($candidate.track) recommendation (provisional): [$($candidate.fullName)]($($candidate.repositoryUrl)).")
         $lines.Add("Reported work: [$(ConvertTo-MarkdownText $candidate.issueTitle)]($($candidate.issueUrl)).")
         $lines.Add("Release evidence: $($candidate.releaseEvidence). Next investigation: $($candidate.workKind).")
-        $lines.Add('Review the issue and reproduce it on Windows Arm64 before selecting a build target or making changes.')
+        $lines.Add('Verify that native support is still missing on Windows Arm64 before selecting a build target or making changes.')
     }
     if ($report.status -eq 'completed') {
         foreach ($source in $report.sources) {
@@ -91,11 +99,11 @@ function Save-Discovery {
         }
     } else { $lines.Add('No recommendations: discovery has not completed successfully.') }
     $lines.Add('')
-    $lines.Add('| Source ranks | Repository | Lifetime stars | Weekly stars | Language | Issue assessment | Open matches / inspected | Release / Arm64 evidence |')
+    $lines.Add('| Source ranks | Repository | Lifetime stars | Weekly stars | Language | Issue assessment | Open matches / inspected | Native support selection |')
     $lines.Add('| --- | --- | --- | --- | --- | --- | --- | --- |')
     foreach ($repository in $report.repositories) {
         $ranks = ($repository.tracks | ForEach-Object { "$_ #$($repository.sourceRanks[$_])" }) -join ', '
-        $lines.Add("| $ranks | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $($repository.weeklyStars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) | $($repository.release.status) / $($repository.release.windowsArm64) |")
+        $lines.Add("| $ranks | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $($repository.weeklyStars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) | $($repository.nativeSupport.status) |")
     }
     $lines.Add('')
     $lines.Add('## Foundational selection rationale')
@@ -113,6 +121,15 @@ function Save-Discovery {
             }
         }
         if ($repository.evidenceTruncated) { $lines.Add("- $($repository.fullName): additional matching issues were not inspected.") }
+    }
+    $lines.Add('')
+    $lines.Add('## Official distribution evidence')
+    foreach ($repository in $report.repositories) {
+        $lines.Add("- $($repository.fullName): $($repository.nativeSupport.status) ($($repository.nativeSupport.reason)).")
+        foreach ($channel in $repository.nativeSupport.channels) {
+            $lines.Add("  $($channel.provider): $($channel.status); version $(ConvertTo-MarkdownText $channel.version); source $(ConvertTo-MarkdownText $channel.url).")
+            foreach ($example in $channel.examples) { $lines.Add("  Advertised file/package: $(ConvertTo-MarkdownText $example)") }
+        }
     }
     $lines.Add('')
     $lines.Add('## Release binary evidence')
@@ -188,11 +205,16 @@ function Invoke-DiscoverySearch([string] $Query) {
 function Get-IssueClassification([string] $Title) {
     if ($Title -notmatch '(?i)\bwindows\b' -or $Title -notmatch '(?i)\b(?:arm64|aarch64)\b|\bwindows on arm\b' -or
         $Title -match '(?i)\b(?:question|how|documentation|docs|guide|already|works|emulat\w*)\b|\bx(?:64|86)\s+fallback\b') { return 'needs_review' }
-    if ($Title -match '(?i)\b(?:fails?|failing|failure|errors?|crash(?:es|ing)?|broken|cannot|unable|unsupported)\b' -or
-        $Title -match "(?i)\b(?:can.t|doesn.t work|not working|not supported)\b") { return 'reported_arm64_work' }
-    if ($Title -match '(?i)\b(?:add|implement|enable|provide|port|request)\b' -or
-        $Title -match '(?i)\bsupport\s+(?:for\s+)?windows\b|\bwindows\b.{0,40}\b(?:arm64|aarch64)\s+support\b') {
-        return 'reported_arm64_work'
+    if ($Title -match '(?i)\b(?:fails?|failing|failure|errors?|crash(?:es|ing)?|broken|regress\w*|slow|performance|incorrect)\b') {
+        return 'existing_support_bug'
+    }
+    $distribution = '(?:support|binar(?:y|ies)|builds?|wheels?|packages?|installers?)'
+    if ($Title -match "(?i)\b(?:add|implement|enable|provide|request)\b.{0,80}\b$distribution\b" -or
+        $Title -match '(?i)\bport\b.{0,30}\b(?:to|for)\b' -or
+        $Title -match "(?i)\b(?:missing|no|lack(?:s|ing)?)\b.{0,60}\b$distribution\b" -or
+        $Title -match "(?i)\b$distribution\b.{0,60}\b(?:missing|unavailable|not available)\b" -or
+        $Title -match '(?i)\b(?:windows[\s-]+(?:on[\s-]+)?(?:arm64|aarch64|arm)|(?:arm64|aarch64)[\s-]+windows)\b.{0,15}\b(?:is\s+)?(?:unsupported|not supported)\b') {
+        return 'reported_missing_native_support'
     }
     'needs_review'
 }
@@ -200,8 +222,9 @@ function Get-IssueClassification([string] $Title) {
 function Get-UpstreamFixEvidence {
     $targets = @(
         foreach ($repository in $report.repositories) {
+            if ($repository.nativeSupport.status -ne 'missing_in_reviewed_channels') { continue }
             foreach ($issue in $repository.issues) {
-                if ($issue.classification -eq 'reported_arm64_work') {
+                if ($issue.classification -eq 'reported_missing_native_support') {
                     @{ repository = $repository.fullName; issue = $issue }
                 }
             }
@@ -310,12 +333,55 @@ function Get-UpstreamFixEvidence {
     $review.status = 'completed'
 }
 
+function Get-DistributionEvidence([hashtable] $Catalog) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    foreach ($repository in $report.repositories) {
+        $support = $repository.nativeSupport
+        $support.status = 'assessing'
+        $github = Get-GitHubDistributionEvidence $repository.release
+        $support.channels += $github
+        $profile = $Catalog.repositories[$repository.fullName]
+        $reviewed = @()
+        foreach ($channel in $profile) {
+            if ($channel.provider -eq 'github') { $reviewed += $github; continue }
+            if ($clock.Elapsed.TotalSeconds -ge 180) { throw 'Distribution metadata phase exceeded its time budget; support remains unverified.' }
+            $package = [uri]::EscapeDataString($channel.package)
+            $uri = if ($channel.provider -eq 'pypi') { "https://pypi.org/pypi/$package/json" }
+                else { "https://registry.npmjs.org/$package/latest" }
+            $request = @{ endpoint = "$($channel.provider)_distribution"; repository = $repository.fullName
+                uri = $uri; httpStatus = $null }
+            $report.requests += $request
+            Save-Discovery
+            $metadata = Receive-DistributionMetadata -Uri $uri -Request $request
+            $evidence = Get-RegistryDistributionEvidence $channel $metadata
+            $evidence.url = $uri
+            $support.channels += $evidence
+            $reviewed += $evidence
+        }
+        if (@($support.channels | Where-Object status -eq 'native_advertised').Count) {
+            $support.status = 'native_distribution_available'; $support.reason = 'already_publishes_or_advertises_windows_arm64'
+        } elseif (@($reviewed | Where-Object status -eq 'portable_distribution').Count) {
+            $support.status = 'not_a_native_port_candidate'; $support.reason = 'platform_independent_distribution'
+        } elseif (-not $profile) {
+            $support.status = 'unverified'; $support.reason = 'official_distribution_channels_not_reviewed'
+        } elseif (@($reviewed | Where-Object status -ne 'missing_in_channel').Count -or $repository.release.artifactProblem) {
+            $support.status = 'unverified'; $support.reason = 'channel_evidence_incomplete_or_artifact_bug'
+        } else {
+            $support.status = 'missing_in_reviewed_channels'; $support.reason = 'no_native_distribution_in_reviewed_channel_inventory'
+        }
+        $report.distributionAssessedCount++
+        Save-Discovery
+    }
+}
+
 $currentRepository = $null
 try {
     if ($CreatePullRequest) {
         throw 'Discovery is read-only. Leave createForkPullRequest false; review a candidate and supply sourceRepositoryUrl in a separate run before creating a fork PR.'
     }
     if ($Track -cnotin @('both', 'trending', 'foundational')) { throw 'Select both, trending or foundational discovery.' }
+    $distributionCatalog = Read-DistributionChannels
+    $report.distributionCatalogSha256 = $distributionCatalog.sha256
     Write-Host "Discovering $Track repositories using $($report.authMode) GitHub.com reads ($interval seconds between searches)."
     $seeds = [Collections.Generic.List[object]]::new()
     $seen = @{}
@@ -374,6 +440,7 @@ try {
             language = $repository.language; defaultBranch = $repository.default_branch
             assessment = 'not_assessed'; matchingIssueCount = $null; evidenceTruncated = $false; issues = @()
             release = @{ status = 'not_assessed'; windowsArm64 = 'unknown'; url = $null }
+            nativeSupport = @{ status = 'not_assessed'; reason = ''; channels = @() }
             issueQuery = "repo:$($repository.full_name) is:issue is:open Windows ARM64 in:title,body"
         }
     }
@@ -399,13 +466,15 @@ try {
                 url = "https://github.com/$($repository.fullName)/issues/$($issue.number)"
                 classification = $classification
                 upstreamFixReview = @{
-                    status = $(if ($classification -eq 'reported_arm64_work') { 'not_assessed' } else { 'not_applicable' })
+                    status = $(if ($classification -eq 'reported_missing_native_support') { 'not_assessed' } else { 'not_applicable' })
                     truncated = $false; pullRequests = @(); referenceQuery = $null; referenceMatchCount = $null
                 }
             }
         }
-        $repository.assessment = if (@($repository.issues | Where-Object classification -eq 'reported_arm64_work').Count) {
-            'reported_arm64_work'
+        $repository.assessment = if (@($repository.issues | Where-Object classification -eq 'reported_missing_native_support').Count) {
+            'reported_missing_native_support'
+        } elseif (@($repository.issues | Where-Object classification -eq 'existing_support_bug').Count) {
+            'existing_support_bug'
         } elseif ($repository.matchingIssueCount) { 'needs_review' } else { 'no_matching_open_issue' }
         $report.assessedCount++
         Save-Discovery
@@ -421,12 +490,14 @@ try {
         Save-Discovery
     }
     $currentRepository = $null
+    Get-DistributionEvidence $distributionCatalog
     Get-UpstreamFixEvidence
     Save-Discovery
     foreach ($source in $report.sources) {
         $sourceTrack = $source.track
         $candidate = $report.repositories | Where-Object {
-            $_.tracks -contains $sourceTrack -and @($_.issues | Where-Object { $_.upstreamFixReview.status -eq 'no_active_linked_fix' }).Count
+            $_.nativeSupport.status -eq 'missing_in_reviewed_channels' -and $_.tracks -contains $sourceTrack -and
+            @($_.issues | Where-Object { $_.upstreamFixReview.status -eq 'no_active_linked_fix' }).Count
         } |
             Sort-Object { $_.sourceRanks[$sourceTrack] } | Select-Object -First 1
         if (-not $candidate) { continue }
@@ -437,16 +508,17 @@ try {
             issueUrl = $issue.url; issueTitle = $issue.title; provisional = $true
             releaseEvidence = $candidate.release.windowsArm64
             releaseUrl = $candidate.release.url
-            workKind = $(if ($candidate.release.artifactProblem) { 'investigate_release_artifact' }
-                elseif ($candidate.release.windowsArm64 -in 'pe_header_found', 'advertised_unverified') { 'investigate_existing_arm64_distribution' }
-                elseif ($candidate.release.windowsArm64 -eq 'x64_observed_arm64_not_found_in_sample') { 'investigate_possible_distribution_gap' }
-                else { 'investigate_reported_arm64_work' })
+            distributionEvidence = $candidate.nativeSupport.status
+            workKind = 'investigate_missing_native_support'
         }
     }
     $report.status = 'completed'
 } catch {
     $report.recommendations = @()
     if ($report.upstreamFixReview.status -eq 'assessing') { $report.upstreamFixReview.status = 'error' }
+    foreach ($repository in $report.repositories) {
+        if ($repository.nativeSupport.status -eq 'assessing') { $repository.nativeSupport.status = 'error' }
+    }
     foreach ($source in $report.sources) {
         if ($source.status -eq 'reading') { $source.status = 'error' }
     }

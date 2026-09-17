@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "repositories": [
-    { "fullName": "python/cpython", "category": "runtime", "reason": "Python runtime and native-extension platform; native regressions can affect downstream applications and wheels." },
+    { "fullName": "python/cpython", "category": "runtime", "reason": "Python runtime and native-extension platform used by downstream applications and wheels; existing native support excludes it from porting recommendations." },
     { "fullName": "nodejs/node", "category": "runtime", "reason": "JavaScript runtime and native-addon platform used by developer tools and services." },
-    { "fullName": "numpy/numpy", "category": "library", "reason": "Numerical array infrastructure; native BLAS and extension issues can block scientific and machine-learning applications." },
+    { "fullName": "numpy/numpy", "category": "library", "reason": "Numerical array infrastructure shared by scientific and machine-learning applications; official PyPI Arm64 wheels exclude it from missing-support recommendations." },
     { "fullName": "openssl/openssl", "category": "library", "reason": "Cryptography and TLS dependency reused by runtimes, network clients and services." },
     { "fullName": "grpc/grpc", "category": "library", "reason": "Native RPC infrastructure and language bindings used by distributed applications." },
     { "fullName": "libgit2/libgit2", "category": "library", "reason": "Shared native Git implementation used by language bindings and developer tools." },

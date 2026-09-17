@@ -4,7 +4,7 @@ name: GitHub discovery and fork trial
   workflow_dispatch:
     inputs:
       sourceRepositoryUrl:
-        description: Source project URL (blank discovers Trending and Foundational candidates)
+        description: Source project URL (blank discovers missing native Windows Arm64 support only)
         type: string
         required: false
         default: ''
@@ -79,7 +79,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
           Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
           Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
-      - name: Discover Trending and Foundational native Windows Arm64 candidates
+      - name: Discover missing native Windows Arm64 support in both source tracks
         if: ${{ inputs.sourceRepositoryUrl == '' }}
         run: .\scripts\Find-Arm64Candidate.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
         env:
@@ -170,7 +170,7 @@ jobs:
             }
             const reason = failed
               ? 'The trial or evidence publication failed. A human must inspect the run logs and resolve the blocker.'
-              : 'Discovery completed. A human must review the separate Trending and Foundational candidates, trace dependency ownership, and check existing fixes before selecting a native repair target. If a track has no candidate, review the recorded limits rather than inventing a port.';
+              : 'Missing-support-only discovery completed. A human must review the separate Trending and Foundational candidates, their official distribution channels, dependency ownership, and existing fixes before selecting a native porting target. Existing native distributions and ordinary bug reports are excluded. If a track has no candidate, review the recorded limits and unverified channels rather than inventing a port.';
             const body = [
               marker, '', '## Human help needed', '', reason, '',
               `Workflow run and all rerun attempts: ${runUrl}`, '',
