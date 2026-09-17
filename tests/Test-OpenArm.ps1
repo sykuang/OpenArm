@@ -183,10 +183,11 @@ try {
     $env:OPENARM_BUILD = "$root\build"
     $env:OPENARM_MAX_ATTEMPTS = '0'
     $env:OPENARM_ENABLE_AGENT = 'false'
-    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64' -or -not $IsWindows) {
+    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64' -or
+        [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64' -or -not $IsWindows) {
         & "$repo\scripts\Invoke-NativeLoop.ps1"
         $native = Read-Json "$root\native\result.json"
-        Assert (-not $native.nativeVerified -and $native.route -eq 'needs_human' -and $native.blockedStep -eq 'host') 'Actual x64 host is rejected, with durable blocker evidence'
+        Assert (-not $native.nativeVerified -and $native.route -eq 'needs_human' -and $native.blockedStep -eq 'host') 'Nonnative host or validation process is rejected, with durable blocker evidence'
     }
     $env:OPENARM_OUTPUT = "$root\bad-approvers"
     $env:OPENARM_REQUIRE_APPROVERS = 'true'
@@ -338,7 +339,8 @@ try {
     Assert-Throws { & "$repo\scripts\Invoke-NativeLoop.ps1" } '*without its approved snapshot*'
     $env:OPENARM_REQUIRE_RESUME_APPROVAL = 'true'
     $env:OPENARM_APPROVED_RESUME_DIGEST = $digest
-    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64' -or -not $IsWindows) {
+    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64' -or
+        [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64' -or -not $IsWindows) {
         & "$repo\scripts\Invoke-NativeLoop.ps1"
         $approvedResult = Read-Json "$root\approved-native\result.json"
         Assert ($approvedResult.resumeApproval.digest -eq $digest) 'Native evidence preserves the approved digest'

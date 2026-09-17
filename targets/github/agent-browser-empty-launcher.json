@@ -1,14 +1,10 @@
 {
   "id": "agent-browser-empty-launcher",
-  "mode": "npm-wrapper",
+  "mode": "diagnose",
   "repository": "https://github.com/vercel-labs/agent-browser",
   "commit": "72007a6788d863611b23bed0b59d0d659c638d8e",
-  "sourceSubdirectory": ".",
-  "fork": "",
   "issue": "https://github.com/NousResearch/hermes-agent/issues/77488",
-  "allowedFiles": ["bin/agent-browser.js"],
-  "packageVersion": "0.37.1",
-  "packageUrl": "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/agent-browser/-/agent-browser-0.37.1.tgz",
-  "packageSha256": "d875c51ecee47ed8aa65b570c27021a96eacdf25399a621d689797346c33da2a",
-  "context": "Repair the agent-browser launcher, not Hermes. The reported 0.27.0 installer could leave a zero-byte win32-arm64 executable after a failed download. Upstream PR #1269 already fixed installation fallback, and v0.37.1 already falls back to x64 when the Arm64 path is absent. The remaining reviewed case is an installed empty file (or directory) at that path: existence alone still selects it. Validation explicitly constructs this regression fixture; it does not claim a clean v0.37.1 install creates it or that it persists across npm upgrades. Retain preference for a nonempty regular source-built Arm64 executable, use the published x64 executable for missing/empty/directory Arm64 paths, preserve argument forwarding, errors and all other platform behavior. Unexpected filesystem errors such as EACCES must remain visible and fail; do not treat them as absence or silently fall back. Only a missing file is an expected stat failure. The previous pipeline candidate passed all four actual launches and 15 of 16 contracts, but was rejected for swallowing EACCES in a broad catch. Preserve this independent check; do not weaken it. Do not rename or copy an x64 binary to an Arm64 name. This is x64-emulation launcher compatibility on a native Windows Arm64 host, not a native port or end-to-end browser validation. Only the existing wrapper may change. This adapter emits candidate artifacts; it does not publish a PR."
+  "readFiles": ["package.json"],
+  "allowedFiles": [],
+  "context": "Native Windows Arm64 support is the only repair goal. This task formerly exercised an empty-file launcher fixture using the published agent-browser v0.37.1 x64 executable under emulation. That result is not native Arm64 support, and the emulation repair adapter is retired. Do not improve x64 fallback, substitute or rename x64 binaries, or propose publishing the historical compatibility patch as a native port. Diagnose the native gap: a reviewed build and packaging path must produce genuine Windows Arm64 binaries and required runtime dependencies, then pass nonempty tests and the installed browser core workflow on an actual Arm64 worker. No native agent-browser build adapter or browser-workflow evidence is currently configured. Report the specific native source/dependency/build/validation work still required; do not invent a native fix. This task is read-only and cannot produce a candidate or PR."
 }

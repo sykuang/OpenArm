@@ -121,30 +121,21 @@ try {
     Assert ((Read-RepairTask hermes-browser-77488).mode -eq 'diagnose') 'Hermes external package issue cannot trigger edits'
     Assert ((Read-RepairTask cmake-smoke).repository -eq 'self') 'Native self-test is not an invented external repair'
     $wrapperTask = Read-RepairTask agent-browser-empty-launcher
-    Assert ($wrapperTask.mode -eq 'npm-wrapper' -and $wrapperTask.fork -eq '') 'Dependency launcher is a separate, nonpublishing task'
+    Assert ($wrapperTask.mode -eq 'diagnose' -and $wrapperTask.allowedFiles.Count -eq 0) 'Retired emulation task permits diagnosis only'
     $wrapperCandidate = New-Candidate
     $wrapperCandidate.taskId = $wrapperTask.id
     $wrapperCandidate.sourceCommit = $wrapperTask.commit
     $wrapperCandidate.files[0].path = 'bin/agent-browser.js'
-    Assert-RepairBundle $wrapperCandidate $wrapperTask '101' ('b' * 40)
-    foreach ($bad in 'scripts/postinstall.js', 'package.json', 'test/launcher.test.mjs', 'bin/other.js') {
-        $wrapperCandidate.files[0].path = $bad
-        Assert-Throws { Assert-RepairBundle $wrapperCandidate $wrapperTask '101' ('b' * 40) } '*forbidden*'
-    }
-    foreach ($case in @(
-        @{ key = 'allowedFiles'; value = @('scripts/postinstall.js') },
-        @{ key = 'repository'; value = 'https://github.com/another/project' },
-        @{ key = 'packageUrl'; value = 'https://example.invalid/package.tgz' },
-        @{ key = 'packageSha256'; value = 'invalid' },
-        @{ key = 'fork'; value = 'tester/agent-browser' },
-        @{ key = 'sourceSubdirectory'; value = 'elsewhere' }
-    )) {
+    Assert-Throws { Assert-RepairBundle $wrapperCandidate $wrapperTask '101' ('b' * 40) } '*trusted task*'
+    $legacyTask = $wrapperTask.Clone(); $legacyTask.mode = 'npm-wrapper'
+    Assert-Throws { Assert-RepairBundle $wrapperCandidate $legacyTask '101' ('b' * 40) } '*trusted task*'
+    foreach ($mode in 'npm-wrapper', 'emulation', 'x64') {
         $badTask = $wrapperTask.Clone(); $badTask.id = 'fixture'
-        $badTask[$case.key] = $case.value
+        $badTask.mode = $mode
         Write-Json "$root\targets\github\fixture.json" $badTask
         $loader = ". '$root\scripts\GitHubRepair.ps1'; Read-RepairTask fixture"
         $code = Invoke-LoggedProcess $pwsh @('-NoProfile', '-Command', $loader) $root "$root\bad-task.log"
-        Assert ($code -ne 0 -and (Get-Content "$root\bad-task.log" -Raw) -like '*Only the reviewed*') "Reject unsupported wrapper task field $($case.key)"
+        Assert ($code -ne 0 -and (Get-Content "$root\bad-task.log" -Raw) -like '*Only diagnosis or native CMake repair*') "Reject nonnative repair mode $mode"
     }
     Assert-Throws { Read-RepairTask '..\smoke' } '*tracked, reviewed*'
     $null = New-Item -ItemType Directory -Path "$root\workspace"
@@ -203,7 +194,7 @@ try {
     Reset-Mock; $global:RepairMock.wrongPr = $true
     $run = Run-Publisher wrong-pr
     Assert ($run.error -like '*outside the requested*') 'Unexpected upstream PR response is a failure'
-    foreach ($scenario in 'tampered', 'empty', 'no-opt-in', 'nonmanual', 'non-native') {
+    foreach ($scenario in 'tampered', 'empty', 'no-opt-in', 'nonmanual', 'non-native', 'emulated-process', 'compatibility-only') {
         Save-Candidate (New-Candidate); Reset-Mock
         if ($scenario -eq 'tampered') { Add-Content "$root\input\candidate.json" ' ' }
         if ($scenario -eq 'empty') { $bundle = New-Candidate; $bundle.files = @(); Save-Candidate $bundle }
@@ -211,6 +202,17 @@ try {
         if ($scenario -eq 'nonmanual') { $env:GITHUB_EVENT_NAME = 'pull_request' }
         if ($scenario -eq 'non-native') {
             $validation = Read-Json "$root\input\report.json"; $validation.native.host.osArchitecture = 'X64'
+            Write-Json "$root\input\report.json" $validation
+        }
+        if ($scenario -eq 'emulated-process') {
+            $validation = Read-Json "$root\input\report.json"; $validation.native.host.processArchitecture = 'X64'
+            Write-Json "$root\input\report.json" $validation
+        }
+        if ($scenario -eq 'compatibility-only') {
+            $validation = Read-Json "$root\input\report.json"
+            $validation.status = 'compatibility_validated'
+            $validation.native.nativeVerified = $false
+            $validation.native.compatibilityVerified = $true
             Write-Json "$root\input\report.json" $validation
         }
         $run = Run-Publisher $scenario

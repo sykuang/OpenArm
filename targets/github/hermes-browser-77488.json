@@ -4,7 +4,7 @@
   "repository": "https://github.com/NousResearch/hermes-agent",
   "commit": "682a95258ce9e877cfb607a5ada6436183efdebb",
   "issue": "https://github.com/NousResearch/hermes-agent/issues/77488",
-  "context": "The report concerns agent-browser npm 0.27.0: bin/agent-browser-win32-arm64.exe is reportedly empty while --version succeeds through JavaScript. Duplicate issue #77051 already has open, unmerged PR #77093. Diagnose ownership and distinguish an npm artifact defect, Hermes integration, native Arm64 support and x64 emulation. Do not propose copying an x64 executable over an Arm64-named file. The package bytes and full browser workflow have not been reproduced by this adapter. No Hermes edit or PR is authorized.",
+  "context": "The report concerns agent-browser npm 0.27.0: bin/agent-browser-win32-arm64.exe is reportedly empty while --version succeeds through JavaScript. Duplicate issue #77051 already has open, unmerged PR #77093. Diagnose ownership and distinguish an npm artifact defect, Hermes integration, native Arm64 support and x64 emulation. The repair goal is native Arm64 support only; do not propose x64 fallback, emulation, or copying an x64 executable over an Arm64-named file. Identify the native dependency build, packaging and browser-workflow evidence still required. The package bytes and full browser workflow have not been reproduced by this adapter. No Hermes edit or PR is authorized.",
   "readFiles": ["package.json", "tools/browser_tool_install.py"],
   "allowedFiles": []
 }

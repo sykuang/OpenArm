@@ -3,9 +3,12 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 . "$repo\scripts\Common.ps1"
 $root = Join-Path $repo ".local\repository-discovery-$([guid]::NewGuid())"
-$null = New-Item -ItemType Directory -Path $root
+$fixture = "$root\fixture"
+$null = New-Item -ItemType Directory -Path "$fixture\scripts", "$fixture\targets\discovery"
+Copy-Item -LiteralPath "$repo\scripts\Common.ps1", "$repo\scripts\ReleaseEvidence.ps1",
+    "$repo\scripts\RepositorySources.ps1", "$repo\scripts\Find-Arm64Candidate.ps1" -Destination "$fixture\scripts"
 $savedEnvironment = @{}
-foreach ($name in 'OPENARM_GITHUB_DISCOVERY_TOKEN', 'OPENARM_GITHUB_TOKEN', 'OPENARM_GITHUB_TRIAL_CREATE') {
+foreach ($name in 'OPENARM_GITHUB_DISCOVERY_TOKEN', 'OPENARM_GITHUB_TOKEN', 'OPENARM_GITHUB_TRIAL_CREATE', 'OPENARM_DISCOVERY_TRACK') {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 $env:OPENARM_GITHUB_TOKEN = 'enterprise-test-placeholder'
@@ -29,6 +32,11 @@ function New-ReleaseAsset([string] $Name, [long] $Size = 256) {
 }
 function Reset-Mock {
     $env:OPENARM_GITHUB_DISCOVERY_TOKEN = 'public-test-placeholder'
+    $env:OPENARM_DISCOVERY_TRACK = 'both'
+    Write-Json "$fixture\targets\discovery\foundational.json" @{
+        schemaVersion = 1
+        repositories = @(11..20 | ForEach-Object { @{ fullName = "owner/repo$_"; category = 'library'; reason = "Shared native dependency $_" } })
+    }
     $global:DiscoveryMock = @{
         calls = [Collections.Generic.List[object]]::new()
         sleeps = [Collections.Generic.List[int]]::new()
@@ -41,13 +49,25 @@ function Reset-Mock {
             'repo1' = @(New-Issue 1 'Windows ARM64 already works: documentation')
             'repo2' = @(New-Issue 2 'Add Windows ARM64 support')
             'repo3' = @(New-Issue 3 'Build fails on Windows ARM64')
+            'repo11' = @(New-Issue 11 'Windows ARM64 build fails')
         }
+        trendingReads = 0; trendingHtml = $null; trendingError = $false
         releases = @{}; downloads = 0; assetMachine = 0xAA64; assetFailure = $false
         issueTotal = @{}; incompleteAt = 0; failAt = 0; failStatus = 403
-        throwAt = 0; malformedAt = 0; total = 100
+        throwAt = 0; malformedAt = 0
     }
 }
 function global:Start-Sleep { param($Seconds) $global:DiscoveryMock.sleeps.Add($Seconds) }
+function global:Mock-DiscoveryTrending {
+    $m = $global:DiscoveryMock
+    $m.trendingReads++
+    if ($m.trendingError) { throw 'GitHub Trending returned HTTP 429; no retry.' }
+    if ($null -ne $m.trendingHtml) { return $m.trendingHtml }
+    (1..12 | ForEach-Object {
+        "<article class=`"Box-row`"><h2><a href=`"/owner/repo$_`">Repository</a></h2><span>$(1000 + $_) stars this week</span></article>"
+    }) -join "`n"
+}
+Set-Alias -Name Receive-GitHubTrending -Value Mock-DiscoveryTrending -Scope Global
 function global:Mock-DiscoveryBytes {
     param($Uri, $ExpectedSize, $PrefixOnly, $Budget)
     $m = $global:DiscoveryMock
@@ -84,9 +104,8 @@ function global:Invoke-RestMethod {
         Set-Variable -Name $StatusCodeVariable -Value 404 -Scope 1
         return [pscustomobject]@{ message = 'Not Found' }
     }
-    if ($url.AbsolutePath -eq '/search/repositories') {
-        $items = $m.repositories
-        $total = $m.total
+    if ($url.AbsolutePath -match '^/repos/owner/repo(\d+)$') {
+        return $m.repositories[[int]$Matches[1] - 1] | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     } elseif ($m.calls[-1].route -match '^/search/issues\?q=repo:owner/(repo\d+) is:issue is:open Windows ARM64 in:title,body&sort=updated&order=desc&per_page=5&page=1$') {
         $name = $Matches[1]
         $items = if ($m.issues.ContainsKey($name)) { @($m.issues[$name]) } else { @() }
@@ -98,7 +117,7 @@ function global:Invoke-RestMethod {
 function Run-Discovery([string] $Name, [hashtable] $Arguments = @{}) {
     $output = Join-Path $root $Name
     $errorText = ''
-    try { & "$repo\scripts\Find-Arm64Candidate.ps1" -Output $output -OutputRoot $root @Arguments }
+    try { & "$fixture\scripts\Find-Arm64Candidate.ps1" -Output $output -OutputRoot $root @Arguments }
     catch { $errorText = $_.Exception.Message }
     $path = Join-Path $output 'discovery.json'
     @{ error = $errorText; output = $output
@@ -110,19 +129,84 @@ try {
     Assert (-not $run.error) "Public discovery command succeeds: $($run.error)"
     $r = $run.report
     Assert ($r.status -eq 'completed' -and $r.repositories.Count -eq 20 -and $r.assessedCount -eq 20) 'Exactly twenty repositories are assessed'
-    Assert ($global:DiscoveryMock.calls.Count -eq 41) 'One repository search, twenty issue searches and twenty latest-release reads only'
+    Assert ($global:DiscoveryMock.calls.Count -eq 60 -and $global:DiscoveryMock.trendingReads -eq 1) 'One weekly page plus twenty metadata, issue and release reads, with no repository star search'
     Assert ($r.releaseAssessedCount -eq 20 -and $r.repositories[0].release.status -eq 'no_published_release') 'A missing stable release stays unknown, not proof of absent Arm64 support'
-    Assert ($global:DiscoveryMock.calls[0].route -eq '/search/repositories?q=stars:>=100000 is:public archived:false fork:false&sort=stars&order=desc&per_page=20&page=1') 'Ranking uses an explicit safe threshold, descending stars and only the first twenty'
-    Assert (($r.repositories.fullName -join ',') -eq ((1..20 | ForEach-Object { "owner/repo$_" }) -join ',')) 'API star order and all repository identities are preserved'
+    Assert ($global:DiscoveryMock.calls[0].route -eq '/repos/owner/repo1' -and $r.sources.Count -eq 2) 'Repository identity comes from the two reviewed sources, not an all-time-star search'
+    Assert (($r.repositories.fullName -join ',') -eq ((1..20 | ForEach-Object { "owner/repo$_" }) -join ',')) 'Displayed Trending order and curated Foundational order are preserved independently'
     Assert ($r.repositories[0].assessment -eq 'needs_review' -and $r.repositories[3].assessment -eq 'no_matching_open_issue') 'Incidental mentions and no matches do not imply lack of support'
     Assert ($r.repositories[1].assessment -eq 'reported_arm64_work' -and $r.repositories[2].assessment -eq 'reported_arm64_work') 'Explicit support requests and build failures are recognized'
-    Assert ($r.recommendation.fullName -eq 'owner/repo2' -and $r.recommendation.issueUrl -eq 'https://github.com/owner/repo2/issues/1') 'Highest-star issue-backed candidate is selected'
-    Assert ($r.nativeVerified -eq $false -and $r.recommendation.provisional -eq $true) 'Recommendation is explicitly provisional, never native proof'
+    Assert ($r.recommendations.Count -eq 2 -and $r.recommendations[0].fullName -eq 'owner/repo2' -and
+        $r.recommendations[1].fullName -eq 'owner/repo11') 'One issue-backed candidate per track is selected'
+    Assert ($r.nativeVerified -eq $false -and @($r.recommendations | Where-Object { -not $_.provisional }).Count -eq 0) 'Recommendations are explicitly provisional, never native proof'
+    Assert ($r.repositories[0].weeklyStars -eq 1001 -and $r.repositories[10].sourceRanks.foundational -eq 1 -and
+        $null -eq $r.repositories[10].weeklyStars) 'Weekly observations and curated priorities are not mixed or fabricated'
     Assert ($r.authMode -eq 'token' -and @($global:DiscoveryMock.calls | Where-Object authorization -ne 'Bearer public-test-placeholder').Count -eq 0) 'Only the separate public discovery token is used'
     Assert ($global:DiscoveryMock.sleeps.Count -eq 20 -and @($global:DiscoveryMock.sleeps | Where-Object { $_ -ne 3 }).Count -eq 0) 'Authenticated searches are paced below thirty per minute'
     $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
     Assert ($markdown -like '*owner/repo20*' -and $markdown -like '*Add Windows ARM64 support*' -and $markdown -like '*provisional*') 'Readable report includes the full ranking and evidence'
-    Assert ($r.startedAt -and $r.completedAt -and $r.repositoryQuery -and $r.limitations.Count -gt 0) 'Search scope, timestamps and limitations are durable'
+    Assert ($r.startedAt -and $r.completedAt -and $r.sources[0].snapshotSha256 -match '^[a-f0-9]{64}$' -and
+        $r.sources[1].catalogSha256 -match '^[a-f0-9]{64}$' -and $r.limitations.Count -gt 0) 'Source provenance, timestamps and limitations are durable'
+
+    Reset-Mock
+    $global:DiscoveryMock.repositories[0].stargazers_count = 0
+    $global:DiscoveryMock.repositories[1].stargazers_count = 9999999
+    $global:DiscoveryMock.repositories[10].stargazers_count = 5
+    $run = Run-Discovery 'no-star-threshold'
+    Assert (-not $run.error -and $run.report.recommendations[1].fullName -eq 'owner/repo11') 'Low-star foundational dependencies remain eligible and lifetime stars do not rerank either track'
+
+    foreach ($track in 'trending', 'foundational') {
+        Reset-Mock
+        $env:OPENARM_DISCOVERY_TRACK = $track
+        $run = Run-Discovery "track-$track"
+        Assert (-not $run.error -and $run.report.requestedCount -eq 10 -and $run.report.recommendations.Count -eq 1 -and
+            $run.report.recommendations[0].track -eq $track -and $global:DiscoveryMock.calls.Count -eq 30) 'Either track can run independently using the real workflow environment input'
+        Assert ($global:DiscoveryMock.trendingReads -eq $(if ($track -eq 'trending') { 1 } else { 0 })) 'Foundational-only mode does not fetch Trending'
+    }
+    Reset-Mock
+    $catalog = Read-Json "$fixture\targets\discovery\foundational.json"
+    $catalog.repositories[0].fullName = 'owner/repo2'
+    Write-Json "$fixture\targets\discovery\foundational.json" $catalog
+    $run = Run-Discovery 'shared-candidate'
+    Assert (-not $run.error -and $run.report.requestedCount -eq 19 -and $global:DiscoveryMock.calls.Count -eq 57 -and
+        $run.report.repositories[1].tracks.Count -eq 2 -and $run.report.recommendations.Count -eq 2 -and
+        ($run.report.recommendations.fullName -join ',') -eq 'owner/repo2,owner/repo2') 'A shared candidate retains both ranks but is assessed only once'
+
+    foreach ($case in 'empty', 'duplicate', 'bad-path', 'missing-weekly', 'oversized', 'http') {
+        Reset-Mock
+        $html = Mock-DiscoveryTrending
+        $global:DiscoveryMock.trendingReads = 0
+        $global:DiscoveryMock.trendingHtml = switch ($case) {
+            'empty' { '<html>Unexpected page</html>' }
+            'duplicate' { $html.Replace('/owner/repo2"', '/owner/repo1"') }
+            'bad-path' { $html.Replace('/owner/repo1"', '/owner/../../bad"') }
+            'missing-weekly' { $html.Replace('1001 stars this week', '1001 stars today') }
+            'oversized' { 'x' * (2MB + 1) }
+            default { $html }
+        }
+        if ($case -eq 'http') { $global:DiscoveryMock.trendingError = $true }
+        $run = Run-Discovery "trending-error-$case"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0 -and
+            $run.report.sources[0].status -eq 'error' -and $global:DiscoveryMock.calls.Count -eq 0 -and
+            $global:DiscoveryMock.trendingReads -eq 1) "Trending $case fails visibly without a lifetime-star fallback"
+    }
+    foreach ($case in 'empty', 'too-many', 'duplicate', 'bad-path', 'missing-reason') {
+        Reset-Mock
+        $catalog = Read-Json "$fixture\targets\discovery\foundational.json"
+        switch ($case) {
+            'empty' { $catalog.repositories = @() }
+            'too-many' { $catalog.repositories += $catalog.repositories[0] }
+            'duplicate' { $catalog.repositories[1] = $catalog.repositories[0] }
+            'bad-path' { $catalog.repositories[0].fullName = 'owner/../../bad' }
+            'missing-reason' { $catalog.repositories[0].reason = '' }
+        }
+        Write-Json "$fixture\targets\discovery\foundational.json" $catalog
+        $run = Run-Discovery "catalog-error-$case"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.sources[1].status -eq 'error' -and
+            $global:DiscoveryMock.calls.Count -eq 0) "Invalid foundational catalog $case cannot drive API access"
+    }
+    Reset-Mock
+    $run = Run-Discovery 'invalid-track' @{ Track = 'unreviewed' }
+    Assert ($run.error -and $global:DiscoveryMock.calls.Count -eq 0 -and $global:DiscoveryMock.trendingReads -eq 0) 'Unreviewed discovery tracks fail before network access'
 
     foreach ($case in 'arm64', 'x64', 'mislabeled', 'empty', 'msi', 'no-assets') {
         Reset-Mock
@@ -140,8 +224,8 @@ try {
             'no-assets' { 'investigate_reported_arm64_work' }
             default { 'investigate_existing_arm64_distribution' }
         }
-        Assert (-not $run.error -and $run.report.recommendation.fullName -eq 'owner/repo2' -and
-            $run.report.recommendation.workKind -eq $expected) "Release evidence changes the investigation, not the issue-backed star ranking: $case ($($run.error))"
+        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo2' -and
+            $run.report.recommendations[0].workKind -eq $expected) "Release evidence changes the investigation, not the independent track ranking: $case ($($run.error))"
         $release = $run.report.repositories[1].release
         Assert ($release.tag -eq 'v1' -and ([DateTimeOffset]$release.publishedAt).ToUniversalTime().ToString('o') -like '2026-09-16T00:00:00*' -and
             $release.url -eq 'https://github.com/owner/repo2/releases/tag/v1') 'Latest-release provenance is durable'
@@ -156,8 +240,8 @@ try {
         Reset-Mock
         $global:DiscoveryMock.releases['repo2'] = New-Release @(New-ReleaseAsset 'app.exe')
         switch ($case) {
-            'http' { $global:DiscoveryMock.failAt = 23 }
-            'malformed' { $global:DiscoveryMock.malformedAt = 23 }
+            'http' { $global:DiscoveryMock.failAt = 42 }
+            'malformed' { $global:DiscoveryMock.malformedAt = 42 }
             'draft' { $global:DiscoveryMock.releases['repo2'].draft = $true }
             'prerelease' { $global:DiscoveryMock.releases['repo2'].prerelease = $true }
             'date' { $global:DiscoveryMock.releases['repo2'].published_at = 'not a date' }
@@ -165,9 +249,9 @@ try {
             'download' { $global:DiscoveryMock.assetFailure = $true }
         }
         $run = Run-Discovery "release-error-$case"
-        Assert ($run.error -and $run.report.status -eq 'failed' -and $null -eq $run.report.recommendation -and
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0 -and
             $run.report.assessedCount -eq 20 -and $run.report.releaseAssessedCount -eq 1 -and
-            $global:DiscoveryMock.calls.Count -eq 23) "Release failure retains issue progress but prevents a premature recommendation: $case"
+            $global:DiscoveryMock.calls.Count -eq 42) "Release failure retains issue progress but prevents premature recommendations: $case"
         Assert ($run.report.repositories[1].assessment -eq 'reported_arm64_work' -and
             $run.report.repositories[1].release.status -eq 'error') 'Release errors do not erase completed issue assessments'
         if ($case -eq 'download') {
@@ -184,7 +268,7 @@ try {
     Reset-Mock
     $global:DiscoveryMock.issues = @{}
     $run = Run-Discovery 'none'
-    Assert (-not $run.error -and $run.report.status -eq 'completed' -and $null -eq $run.report.recommendation) 'Complete scan can honestly recommend no candidate'
+    Assert (-not $run.error -and $run.report.status -eq 'completed' -and $run.report.recommendations.Count -eq 0) 'Complete scan can honestly recommend no candidate'
     Assert ((Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw) -like '*No evidence-backed candidate*') 'No candidate is explicit in the readable report'
 
     foreach ($token in '', '$(OpenArm.GitHubDiscoveryToken)') {
@@ -198,11 +282,12 @@ try {
 
     foreach ($title in 'Question about Windows ARM64 support', 'How does Windows ARM64 support work?',
         'Windows ARM64 documentation update', 'Windows ARM64 works on my machine', 'Add Linux ARM64 support',
-        'ARM64 fails to build on macOS', 'Windows ARM64 support is already implemented') {
+        'ARM64 fails to build on macOS', 'Windows ARM64 support is already implemented',
+        'Add Windows ARM64 x64 fallback', 'Fix Windows ARM64 emulation') {
         Reset-Mock
         $global:DiscoveryMock.issues = @{ 'repo1' = @(New-Issue 1 $title) }
         $run = Run-Discovery "mention-$([guid]::NewGuid())"
-        Assert (-not $run.error -and $null -eq $run.report.recommendation -and
+        Assert (-not $run.error -and $run.report.recommendations.Count -eq 0 -and
             $run.report.repositories[0].assessment -eq 'needs_review') "Not absence proof: $title"
     }
 
@@ -212,42 +297,41 @@ try {
     $run = Run-Discovery 'bounded-issues'
     Assert (-not $run.error -and $run.report.repositories[1].matchingIssueCount -eq 12 -and
         $run.report.repositories[1].issues.Count -eq 5 -and $run.report.repositories[1].evidenceTruncated) 'Only five recent issue titles are inspected and truncation stays visible'
-    Assert ($global:DiscoveryMock.calls.Count -eq 41 -and $run.report.recommendation.fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
+    Assert ($global:DiscoveryMock.calls.Count -eq 60 -and $run.report.recommendations[0].fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
 
     foreach ($field in 'incompleteAt', 'malformedAt', 'throwAt') {
-        foreach ($at in 1, 4) {
+        $points = if ($field -eq 'incompleteAt') { @(21, 24) } else { @(1, 24) }
+        foreach ($at in $points) {
             Reset-Mock
             $global:DiscoveryMock[$field] = $at
             $run = Run-Discovery "$field-$at"
-            Assert ($run.error -and $run.report.status -eq 'failed' -and $null -eq $run.report.recommendation) "$field at request $at cannot become a successful scan"
-            Assert ($global:DiscoveryMock.calls.Count -eq $at -and $run.report.assessedCount -eq $(if ($at -eq 1) { 0 } else { 2 })) 'Failure is bounded and preserves assessed progress without a premature recommendation'
+            Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0) "$field at request $at cannot become a successful scan"
+            Assert ($global:DiscoveryMock.calls.Count -eq $at -and $run.report.assessedCount -eq $(if ($at -le 20) { 0 } else { $at - 21 })) 'Failure is bounded and preserves assessed progress without premature recommendations'
             Assert (Test-Path -LiteralPath (Join-Path $run.output 'discovery.md')) 'Failure retains a readable report'
         }
     }
     foreach ($status in 301, 401, 403, 422, 429, 503) {
         Reset-Mock
-        $global:DiscoveryMock.failAt = 4; $global:DiscoveryMock.failStatus = $status
+        $global:DiscoveryMock.failAt = 24; $global:DiscoveryMock.failStatus = $status
         $run = Run-Discovery "http-$status"
         Assert ($run.error -like "*HTTP $status*" -and $run.report.status -eq 'failed' -and
-            $global:DiscoveryMock.calls.Count -eq 4 -and $run.report.assessedCount -eq 2) "HTTP $status stops explicitly without widening or an authentication fallback"
+            $global:DiscoveryMock.calls.Count -eq 24 -and $run.report.assessedCount -eq 3) "HTTP $status stops explicitly without widening or an authentication fallback"
     }
 
-    foreach ($case in 'fewer', 'extra', 'order', 'duplicate', 'private', 'archived', 'fork', 'name', 'threshold', 'scope') {
+    foreach ($case in 'duplicate', 'private', 'archived', 'fork', 'name', 'negative-stars', 'bad-stars', 'branch') {
         Reset-Mock
         switch ($case) {
-            'fewer' { $global:DiscoveryMock.repositories = @($global:DiscoveryMock.repositories | Select-Object -First 19) }
-            'extra' { $global:DiscoveryMock.repositories += $global:DiscoveryMock.repositories[0] }
-            'order' { $global:DiscoveryMock.repositories[1].stargazers_count = 900000 }
             'duplicate' { $global:DiscoveryMock.repositories[1] = $global:DiscoveryMock.repositories[0] }
             'private' { $global:DiscoveryMock.repositories[1].private = $true }
             'archived' { $global:DiscoveryMock.repositories[1].archived = $true }
             'fork' { $global:DiscoveryMock.repositories[1].fork = $true }
             'name' { $global:DiscoveryMock.repositories[1].full_name = 'owner/../../elsewhere' }
-            'threshold' { $global:DiscoveryMock.repositories[19].stargazers_count = 99999 }
-            'scope' { $global:DiscoveryMock.total = 4001 }
+            'negative-stars' { $global:DiscoveryMock.repositories[1].stargazers_count = -1 }
+            'bad-stars' { $global:DiscoveryMock.repositories[1].stargazers_count = 'many' }
+            'branch' { $global:DiscoveryMock.repositories[1].default_branch = '' }
         }
         $run = Run-Discovery "invalid-$case"
-        Assert ($run.error -and $run.report.status -eq 'failed' -and $global:DiscoveryMock.calls.Count -eq 1) "Invalid top twenty ($case) cannot drive further requests"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $global:DiscoveryMock.calls.Count -eq 2) "Invalid selected repository ($case) cannot drive issue or release requests"
     }
     foreach ($case in 'pull-request', 'closed', 'wrong-repo', 'extra') {
         Reset-Mock
@@ -258,7 +342,7 @@ try {
             'extra' { $global:DiscoveryMock.issues['repo2'] = @(1..6 | ForEach-Object { New-Issue 2 'Add Windows ARM64 support' $_ }) }
         }
         $run = Run-Discovery "invalid-issue-$case"
-        Assert ($run.error -and $run.report.status -eq 'failed' -and $null -eq $run.report.recommendation) "Unexpected issue data ($case) fails closed"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0) "Unexpected issue data ($case) fails closed"
     }
 
     Reset-Mock
@@ -286,6 +370,8 @@ try {
     Assert (@($artifacts | Where-Object { $_ -match 'public-test-placeholder|enterprise-test-placeholder|Do not persist raw issue bodies' }).Count -eq 0) 'Artifacts exclude tokens, raw API bodies and raw transport errors'
     Write-Host "$checks repository discovery checks passed."
 } finally {
+    Remove-Item Alias:\Receive-GitHubTrending -ErrorAction SilentlyContinue
+    Remove-Item Function:\Mock-DiscoveryTrending -ErrorAction SilentlyContinue
     Remove-Item Alias:\Receive-ReleaseBytes -ErrorAction SilentlyContinue
     Remove-Item Function:\Mock-DiscoveryBytes -ErrorAction SilentlyContinue
     Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue

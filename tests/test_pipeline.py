@@ -155,7 +155,10 @@ class PipelineChecks(unittest.TestCase):
         trial = load(ROOT / ".github" / "workflows" / "github-trial.yml")
         self.assertEqual(set(trial["on"]), {"workflow_dispatch"})
         parameters = trial["on"]["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(parameters), {"sourceRepositoryUrl", "forkOwner", "createForkPullRequest", "createHumanHelpIssue"})
+        self.assertEqual(set(parameters), {"sourceRepositoryUrl", "discoveryTrack", "forkOwner", "createForkPullRequest", "createHumanHelpIssue"})
+        self.assertEqual(parameters["discoveryTrack"]["type"], "choice")
+        self.assertEqual(parameters["discoveryTrack"]["default"], "both")
+        self.assertEqual(parameters["discoveryTrack"]["options"], ["both", "trending", "foundational"])
         self.assertEqual(parameters["sourceRepositoryUrl"]["default"], "")
         self.assertEqual(parameters["forkOwner"]["default"], "")
         self.assertIs(parameters["createForkPullRequest"]["default"], False)
@@ -188,6 +191,7 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(discover["env"], {
             "OPENARM_GITHUB_DISCOVERY_TOKEN": "${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}",
             "OPENARM_GITHUB_TRIAL_CREATE": "${{ inputs.createForkPullRequest }}",
+            "OPENARM_DISCOVERY_TRACK": "${{ inputs.discoveryTrack }}",
         })
         self.assertEqual(manual["env"], {
             "OPENARM_GITHUB_TOKEN": "${{ secrets.OPENARM_GITHUB_TOKEN }}",
@@ -344,38 +348,44 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(smoke["fork"], "")
         self.assertEqual(smoke["allowedFiles"], ["main.cpp"])
 
-    def test_dependency_launcher_keeps_compatibility_separate_from_native_port(self):
+    def test_repairs_require_native_support_not_emulation(self):
         task = json.loads((ROOT / "targets" / "github" / "agent-browser-empty-launcher.json").read_text())
-        self.assertEqual(task["mode"], "npm-wrapper")
+        self.assertEqual(task["mode"], "diagnose")
         self.assertEqual(task["repository"], "https://github.com/vercel-labs/agent-browser")
-        self.assertEqual(task["allowedFiles"], ["bin/agent-browser.js"])
-        self.assertEqual(task["fork"], "")
+        self.assertEqual(task["allowedFiles"], [])
+        self.assertEqual(task["readFiles"], ["package.json"])
+        self.assertNotIn("packageUrl", task)
         self.assertRegex(task["commit"], r"^[a-f0-9]{40}$")
-        self.assertRegex(task["packageSha256"], r"^[a-f0-9]{64}$")
+        self.assertIn("native", task["context"])
         workflow = load(ROOT / ".github" / "workflows" / "copilot-repair.yml")
-        for name in ("prepare", "agent", "validate"):
-            node = next(step for step in workflow["jobs"][name]["steps"]
-                        if step.get("uses", "").startswith("actions/setup-node@"))
-            self.assertEqual(node["with"], {"node-version": "24", "architecture": "arm64"})
-        adapter = (ROOT / "scripts" / "AgentBrowserRepair.ps1").read_text()
-        self.assertIn("packageSha256", adapter)
-        self.assertIn("-MaximumRedirection 0", adapter)
-        self.assertNotIn("npm install", adapter)
-        self.assertNotIn("postinstall", adapter)
+        node = next(step for step in workflow["jobs"]["agent"]["steps"]
+                    if step.get("uses", "").startswith("actions/setup-node@"))
+        self.assertEqual(node["with"], {"node-version": "24", "architecture": "arm64"})
+        registry = (ROOT / "scripts" / "GitHubRepair.ps1").read_text()
+        self.assertIn("$task.mode -notin @('diagnose', 'cmake')", registry)
+        self.assertIn("$Task.mode -ne 'cmake'", registry)
+        self.assertNotIn("npm-wrapper", registry)
+        self.assertFalse((ROOT / "scripts" / "AgentBrowserRepair.ps1").exists())
         script = (ROOT / "scripts" / "Invoke-CopilotRepair.ps1").read_text()
-        self.assertIn("'compatibility_validated'", script)
-        self.assertIn("$baseline.faultReproduced", script)
-        self.assertIn("$native.compatibilityVerified", script)
-        self.assertIn("checks = $baseline.checks", script)
-        self.assertIn("Select-Object name, exitCode, passed, error, stderr", script)
-        self.assertIn("EACCES", task["context"])
+        self.assertNotIn("compatibility_validated", script)
+        self.assertNotIn("compatibilityVerified", script)
+        self.assertIn("$prepared.status -eq 'repairable' -and $task.mode -ne 'cmake'", script)
+        self.assertIn("-not $native.nativeVerified -or $native.route -ne 'validated'", script)
         publisher = (ROOT / "scripts" / "Publish-GitHubRepair.ps1").read_text()
         self.assertIn("$task.mode -ne 'cmake'", publisher)
-        harness = (ROOT / "tests" / "agent-browser-wrapper.cjs").read_text()
-        self.assertIn("nativeVerified: false", harness)
-        self.assertIn("process.arch, 'arm64'", harness)
-        self.assertIn("Regression stub must stay empty", harness)
-        self.assertIn("Published executable must remain unchanged", harness)
+        native = (ROOT / "scripts" / "Invoke-NativeLoop.ps1").read_text()
+        self.assertIn("$result.host.processArchitecture -ne 'Arm64'", native)
+        self.assertIn("$machine -ne 0xAA64", native)
+        for path in (
+            Path(".github", "skills", "windows-arm64-porting", "SKILL.md"),
+            Path(".github", "agents", "windows-arm64-porting.agent.md"),
+            Path("scripts", "Invoke-NativeLoop.ps1"),
+            Path("scripts", "Invoke-CopilotRepair.ps1"),
+        ):
+            policy = " ".join((ROOT / path).read_text().split())
+            self.assertIn("native Windows Arm64", policy, path)
+            self.assertIn("x64/x86 emulation", policy, path)
+            self.assertIn("0xAA64", policy, path)
 
     def test_human_help_issue_behavior(self):
         workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")

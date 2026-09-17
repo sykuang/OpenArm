@@ -1,11 +1,13 @@
 [CmdletBinding()]
 param(
     [switch] $CreatePullRequest = ($env:OPENARM_GITHUB_TRIAL_CREATE -eq 'true'),
+    [string] $Track = $(if ($env:OPENARM_DISCOVERY_TRACK) { $env:OPENARM_DISCOVERY_TRACK } else { 'both' }),
     [string] $Output = (Join-Path $PSScriptRoot "..\out\discovery-$([guid]::NewGuid())"),
     [string] $OutputRoot = ''
 )
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\ReleaseEvidence.ps1"
+. "$PSScriptRoot\RepositorySources.ps1"
 
 $Output = Resolve-OutputPath -Path $Output -Root $OutputRoot
 if (Test-Path -LiteralPath $Output) { throw 'Discovery output already exists; choose a new directory.' }
@@ -14,11 +16,11 @@ $token = $env:OPENARM_GITHUB_DISCOVERY_TOKEN
 if ([string]::IsNullOrWhiteSpace($token) -or $token.StartsWith('$(')) { $token = '' }
 $interval = if ($token) { 3 } else { 7 }
 $report = @{
-    schemaVersion = 2; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+    schemaVersion = 3; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
     completedAt = $null; apiHost = 'api.github.com'; authMode = $(if ($token) { 'token' } else { 'anonymous' })
-    repositoryQuery = 'stars:>=100000 is:public archived:false fork:false'
-    sort = 'stars'; order = 'desc'; requestedCount = 20; matchingRepositoryCount = $null
-    assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendation = $null; error = $null
+    track = $Track; requestedCount = 0; maxRepositoriesPerTrack = 10
+    assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendations = @(); error = $null
+    sources = @()
     releaseScope = @{
         endpoint = 'releases/latest'; maxAssetsRecordedPerRepository = 100; maxDownloadsPerRepository = 3
         maxZipBytes = 16MB; maxTotalDownloadBytes = 128MB; maxReleasePhaseSeconds = 180
@@ -27,13 +29,17 @@ $report = @{
     }
     repositories = @(); requests = @()
     limitations = @(
-        'Popularity means GitHub.com stars, not suitability for Windows or Arm64.'
-        'The 100000-star threshold preserves the top twenty only if at least twenty qualify; otherwise this scan fails.'
-        'GitHub search is indexed, not a transactionally consistent global snapshot. Ties retain API order.'
+        'Trending uses the first ten entries on the public GitHub weekly Trending page, preserving its displayed order, not lifetime-star order or a computed growth score.'
+        'Weekly-star counts are observations reported by GitHub, not independently reconstructed star histories. Markup/source failures stop the scan; lifetime stars are never substituted.'
+        'Foundational uses a reviewed catalog of at most ten runtimes, toolchains and shared libraries. Catalog order and rationale are curated priorities, not measured dependency counts or proof of missing native support.'
+        'Tracks are ranked independently. Repositories appearing in both are assessed once and retain both source ranks; two recommendation slots can identify the same underlying repair candidate.'
+        'There is no minimum lifetime-star threshold. Repository metadata, issue search and release reads are not a transactionally consistent snapshot.'
         'Each repository search uses open issues containing Windows AND ARM64 in title/body, newest updated first, at most five.'
         'Only explicit Windows Arm64 support requests or failure wording in those titles can yield a provisional recommendation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
+        'Before editing, review existing fixes and trace a reported application blocker to its owning dependency. A shared dependency should be repaired once, not patched separately in every caller.'
+        'Only native Windows Arm64 support is an eligible repair goal. Emulation/fallback reports require review, not automatic remediation; native builds, 0xAA64 runtime binaries and an installed core workflow remain mandatory.'
         'Release scope is the latest published non-prerelease GitHub release and up to 100 assets returned with it, not all distribution channels or older releases.'
         'Missing releases/assets, filenames, unsupported formats and inspection limits do not prove missing Arm64 support.'
         'Filename hints are not verified architecture. PE headers identify individual EXE/DLL machine types, not working applications, signatures, complete integrity or native runtime compatibility.'
@@ -54,27 +60,38 @@ function Save-Discovery {
     $lines = [Collections.Generic.List[string]]::new()
     $lines.Add('# Windows Arm64 repository discovery')
     $lines.Add('')
-    $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/20. Releases assessed: $($report.releaseAssessedCount)/20. Authentication: $($report.authMode).")
+    $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/$($report.requestedCount). Releases assessed: $($report.releaseAssessedCount)/$($report.requestedCount). Authentication: $($report.authMode).")
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
-    $lines.Add("Repository query: ``$($report.repositoryQuery)``; stars descending; first page only.")
+    $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. At most ten repositories per track; no lifetime-star threshold.")
+    foreach ($source in $report.sources) {
+        $lines.Add("- $($source.track): $($source.method); status $($source.status); source $(ConvertTo-MarkdownText $source.location).")
+    }
     if ($report.error) { $lines.Add("Error: $(ConvertTo-MarkdownText $report.error)") }
     $lines.Add('')
-    if ($report.recommendation) {
-        $candidate = $report.recommendation
-        $lines.Add("Recommendation (provisional): [$($candidate.fullName)]($($candidate.repositoryUrl)).")
+    foreach ($candidate in $report.recommendations) {
+        $lines.Add("$($candidate.track) recommendation (provisional): [$($candidate.fullName)]($($candidate.repositoryUrl)).")
         $lines.Add("Reported work: [$(ConvertTo-MarkdownText $candidate.issueTitle)]($($candidate.issueUrl)).")
         $lines.Add("Release evidence: $($candidate.releaseEvidence). Next investigation: $($candidate.workKind).")
         $lines.Add('Review the issue and reproduce it on Windows Arm64 before selecting a build target or making changes.')
-    } elseif ($report.status -eq 'completed') {
-        $lines.Add('No evidence-backed candidate found within these twenty repositories and the bounded issue search.')
-    } else {
-        $lines.Add('No recommendation: discovery has not completed successfully.')
+    }
+    if ($report.status -eq 'completed') {
+        foreach ($source in $report.sources) {
+            if (-not @($report.recommendations | Where-Object track -eq $source.track).Count) {
+                $lines.Add("No evidence-backed candidate found for $($source.track) within this bounded scan.")
+            }
+        }
+    } else { $lines.Add('No recommendations: discovery has not completed successfully.') }
+    $lines.Add('')
+    $lines.Add('| Source ranks | Repository | Lifetime stars | Weekly stars | Language | Issue assessment | Open matches / inspected | Release / Arm64 evidence |')
+    $lines.Add('| --- | --- | --- | --- | --- | --- | --- | --- |')
+    foreach ($repository in $report.repositories) {
+        $ranks = ($repository.tracks | ForEach-Object { "$_ #$($repository.sourceRanks[$_])" }) -join ', '
+        $lines.Add("| $ranks | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $($repository.weeklyStars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) | $($repository.release.status) / $($repository.release.windowsArm64) |")
     }
     $lines.Add('')
-    $lines.Add('| Rank | Repository | Stars | Language | Issue assessment | Open matches / inspected | Release / Arm64 evidence |')
-    $lines.Add('| --- | --- | --- | --- | --- | --- | --- |')
+    $lines.Add('## Foundational selection rationale')
     foreach ($repository in $report.repositories) {
-        $lines.Add("| $($repository.rank) | [$($repository.fullName)]($($repository.url)) | $($repository.stars) | $(ConvertTo-MarkdownText $repository.language) | $($repository.assessment) | $($repository.matchingIssueCount) / $($repository.issues.Count) | $($repository.release.status) / $($repository.release.windowsArm64) |")
+        if ($repository.foundationReason) { $lines.Add("- $($repository.fullName): $(ConvertTo-MarkdownText $repository.foundationReason)") }
     }
     $lines.Add('')
     $lines.Add('## Issue evidence')
@@ -128,28 +145,26 @@ function Invoke-DiscoveryApi([string] $Uri, [hashtable] $Entry, [switch] $AllowN
     $response
 }
 
-function Invoke-DiscoverySearch([string] $Kind, [string] $Query, [int] $Count) {
-    if ($Kind -notin 'repositories', 'issues') { throw 'Unexpected discovery endpoint.' }
+function Invoke-DiscoverySearch([string] $Query) {
     if ($report.requests.Count) { Start-Sleep -Seconds $interval }
-    $sort = if ($Kind -eq 'repositories') { 'stars' } else { 'updated' }
-    $uri = "https://api.github.com/search/${Kind}?q=$([uri]::EscapeDataString($Query))&sort=$sort&order=desc&per_page=$Count&page=1"
-    $response = Invoke-DiscoveryApi $uri @{ endpoint = $Kind; query = $Query; httpStatus = $null }
+    $uri = "https://api.github.com/search/issues?q=$([uri]::EscapeDataString($Query))&sort=updated&order=desc&per_page=5&page=1"
+    $response = Invoke-DiscoveryApi $uri @{ endpoint = 'issues'; query = $Query; httpStatus = $null }
     if ($null -eq $response -or -not $response.PSObject.Properties['incomplete_results'] -or
         $response.incomplete_results -isnot [bool] -or
         -not $response.PSObject.Properties['total_count'] -or
         ($response.total_count -isnot [int] -and $response.total_count -isnot [long]) -or
         $response.total_count -lt 0 -or -not $response.PSObject.Properties['items'] -or
         $response.items -isnot [array]) { throw 'GitHub discovery returned an invalid search response.' }
-    if ($response.incomplete_results) { throw 'GitHub returned incomplete search results; this is not a complete top-twenty assessment. Rerun later.' }
-    if ($response.items.Count -ne [Math]::Min($Count, $response.total_count)) {
+    if ($response.incomplete_results) { throw 'GitHub returned incomplete search results; this is not a complete assessment of the selected repositories. Rerun later.' }
+    if ($response.items.Count -ne [Math]::Min(5, $response.total_count)) {
         throw 'GitHub search returned an unexpected number of items; the assessment is incomplete.'
     }
     $response
 }
 
 function Get-IssueClassification([string] $Title) {
-    if ($Title -notmatch '(?i)\bwindows\b' -or $Title -notmatch '(?i)\b(?:arm64|aarch64)\b' -or
-        $Title -match '(?i)\b(?:question|how|documentation|docs|guide|already|works)\b') { return 'needs_review' }
+    if ($Title -notmatch '(?i)\bwindows\b' -or $Title -notmatch '(?i)\b(?:arm64|aarch64)\b|\bwindows on arm\b' -or
+        $Title -match '(?i)\b(?:question|how|documentation|docs|guide|already|works|emulat\w*)\b|\bx(?:64|86)\s+fallback\b') { return 'needs_review' }
     if ($Title -match '(?i)\b(?:fails?|failing|failure|errors?|crash(?:es|ing)?|broken|cannot|unable|unsupported)\b' -or
         $Title -match "(?i)\b(?:can.t|doesn.t work|not working|not supported)\b") { return 'reported_arm64_work' }
     if ($Title -match '(?i)\b(?:add|implement|enable|provide|port|request)\b' -or
@@ -164,30 +179,61 @@ try {
     if ($CreatePullRequest) {
         throw 'Discovery is read-only. Leave createForkPullRequest false; review a candidate and supply sourceRepositoryUrl in a separate run before creating a fork PR.'
     }
-    Write-Host "Discovering the top twenty public repositories using $($report.authMode) GitHub.com reads ($interval seconds between searches)."
-    $search = Invoke-DiscoverySearch 'repositories' $report.repositoryQuery 20
-    $report.matchingRepositoryCount = $search.total_count
-    if ($search.items.Count -ne 20 -or $search.total_count -gt 4000) {
-        throw 'Cannot establish the top twenty within the star threshold and GitHub search scope; expected at least twenty and at most 4000 qualifying repositories.'
-    }
-    $previousStars = [long]::MaxValue
+    if ($Track -cnotin @('both', 'trending', 'foundational')) { throw 'Select both, trending or foundational discovery.' }
+    Write-Host "Discovering $Track repositories using $($report.authMode) GitHub.com reads ($interval seconds between searches)."
+    $seeds = [Collections.Generic.List[object]]::new()
     $seen = @{}
-    foreach ($repository in $search.items) {
-        if ($repository.full_name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*$' -or
-            $seen.ContainsKey($repository.full_name) -or
+    foreach ($sourceTrack in @('trending', 'foundational')) {
+        if ($Track -ne 'both' -and $Track -ne $sourceTrack) { continue }
+        $source = @{ track = $sourceTrack; status = 'reading'; selectedCount = 0; observedAt = [DateTimeOffset]::UtcNow.ToString('o')
+            method = $(if ($sourceTrack -eq 'trending') { 'github_weekly_trending' } else { 'reviewed_catalog_order' })
+            location = $(if ($sourceTrack -eq 'trending') { 'https://github.com/trending?since=weekly' } else { 'targets\discovery\foundational.json' }) }
+        $report.sources += $source
+        Save-Discovery
+        if ($sourceTrack -eq 'trending') {
+            $request = @{ endpoint = 'weekly_trending'; uri = $source.location; httpStatus = $null }
+            $report.requests += $request
+            $html = Receive-GitHubTrending
+            $request.httpStatus = 200
+            $selection = ConvertFrom-GitHubTrending $html
+            $source.snapshotSha256 = $selection.snapshotSha256
+            $source.availableCount = $selection.availableCount
+        } else {
+            $selection = Read-FoundationalRepositories
+            $source.catalogSha256 = $selection.catalogSha256
+            $source.availableCount = $selection.items.Count
+        }
+        foreach ($item in $selection.items) {
+            if (-not $seen.ContainsKey($item.fullName)) {
+                $seed = @{ fullName = $item.fullName; tracks = @(); sourceRanks = @{}; weeklyStars = $null; foundationReason = $null; foundationCategory = $null }
+                $seen[$item.fullName] = $seed
+                $seeds.Add($seed)
+            }
+            $seed = $seen[$item.fullName]
+            $seed.tracks += $sourceTrack; $seed.sourceRanks[$sourceTrack] = $item.rank
+            if ($sourceTrack -eq 'trending') { $seed.weeklyStars = $item.weeklyStars }
+            else { $seed.foundationReason = $item.reason; $seed.foundationCategory = $item.category }
+        }
+        $source.selectedCount = $selection.items.Count; $source.status = 'completed'
+    }
+    $report.requestedCount = $seeds.Count
+    foreach ($seed in $seeds) {
+        $repository = Invoke-DiscoveryApi "https://api.github.com/repos/$($seed.fullName)" `
+            @{ endpoint = 'repository'; repository = $seed.fullName; httpStatus = $null }
+        if ($repository.full_name -ine $seed.fullName -or
             ($repository.stargazers_count -isnot [int] -and $repository.stargazers_count -isnot [long]) -or
-            $repository.stargazers_count -lt 100000 -or $repository.stargazers_count -gt $previousStars -or
+            $repository.stargazers_count -lt 0 -or
             $repository.private -isnot [bool] -or $repository.private -or
             $repository.archived -isnot [bool] -or $repository.archived -or
             $repository.fork -isnot [bool] -or $repository.fork -or
             $repository.default_branch -isnot [string] -or -not $repository.default_branch -or
             ($null -ne $repository.language -and $repository.language -isnot [string])) {
-            throw 'GitHub returned an invalid, duplicated, ineligible or incorrectly ranked repository.'
+            throw 'GitHub returned an invalid, renamed or ineligible selected repository.'
         }
-        $seen[$repository.full_name] = $true
-        $previousStars = $repository.stargazers_count
         $report.repositories += @{
             rank = $report.repositories.Count + 1; fullName = $repository.full_name
+            tracks = $seed.tracks; sourceRanks = $seed.sourceRanks; weeklyStars = $seed.weeklyStars
+            foundationReason = $seed.foundationReason; foundationCategory = $seed.foundationCategory
             url = "https://github.com/$($repository.full_name)"; stars = $repository.stargazers_count
             language = $repository.language; defaultBranch = $repository.default_branch
             assessment = 'not_assessed'; matchingIssueCount = $null; evidenceTruncated = $false; issues = @()
@@ -197,7 +243,7 @@ try {
     }
     foreach ($repository in $report.repositories) {
         $currentRepository = $repository
-        $issues = Invoke-DiscoverySearch 'issues' $repository.issueQuery 5
+        $issues = Invoke-DiscoverySearch $repository.issueQuery
         $repository.matchingIssueCount = $issues.total_count
         $repository.evidenceTruncated = $issues.total_count -gt 5
         $seenIssues = @{}
@@ -234,10 +280,14 @@ try {
         Save-Discovery
     }
     $currentRepository = $null
-    $candidate = $report.repositories | Where-Object assessment -eq 'reported_arm64_work' | Select-Object -First 1
-    if ($candidate) {
+    foreach ($source in $report.sources) {
+        $sourceTrack = $source.track
+        $candidate = $report.repositories | Where-Object { $_.assessment -eq 'reported_arm64_work' -and $_.tracks -contains $sourceTrack } |
+            Sort-Object { $_.sourceRanks[$sourceTrack] } | Select-Object -First 1
+        if (-not $candidate) { continue }
         $issue = $candidate.issues | Where-Object classification -eq 'reported_arm64_work' | Select-Object -First 1
-        $report.recommendation = @{
+        $report.recommendations += @{
+            track = $sourceTrack; sourceRank = $candidate.sourceRanks[$sourceTrack]; nativeGoal = 'native_windows_arm64'
             fullName = $candidate.fullName; repositoryUrl = $candidate.url; stars = $candidate.stars
             issueUrl = $issue.url; issueTitle = $issue.title; provisional = $true
             releaseEvidence = $candidate.release.windowsArm64
@@ -250,6 +300,9 @@ try {
     }
     $report.status = 'completed'
 } catch {
+    foreach ($source in $report.sources) {
+        if ($source.status -eq 'reading') { $source.status = 'error' }
+    }
     if ($currentRepository) {
         if ($currentRepository.release.status -ne 'not_assessed') { $currentRepository.release.status = 'error' }
         else { $currentRepository.assessment = 'error' }

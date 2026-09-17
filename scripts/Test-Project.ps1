@@ -47,9 +47,12 @@ try {
             Where-Object Extension -in '.ps1', '.py', '.cjs', '.cpp', '.txt'
         Get-Item -LiteralPath (Join-Path $root 'azure-pipelines.yml'), (Join-Path $root 'azure-pipelines-ci.yml'),
             (Join-Path $root '.github\workflows\github-trial.yml'), (Join-Path $root '.github\workflows\copilot-repair.yml'),
+            (Join-Path $root '.github\skills\windows-arm64-porting\SKILL.md'),
+            (Join-Path $root '.github\agents\windows-arm64-porting.agent.md'),
             (Join-Path $root 'native-stage.yml'),
             (Join-Path $root 'requirements-dev.txt'), (Join-Path $root 'targets\smoke.json')
         Get-ChildItem -LiteralPath (Join-Path $root 'targets\github') -Filter *.json
+        Get-ChildItem -LiteralPath (Join-Path $root 'targets\discovery') -Filter *.json
     )
     $report.sourceFiles = @($files | Sort-Object FullName -Unique | ForEach-Object {
         @{ path = [IO.Path]::GetRelativePath($root, $_.FullName)
@@ -61,7 +64,6 @@ try {
     Invoke-Check 'repository-discovery' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-RepositoryDiscovery.ps1'))
     Invoke-Check 'release-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-ReleaseEvidence.ps1'))
     Invoke-Check 'copilot-repair' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-CopilotRepair.ps1'))
-    Invoke-Check 'launcher-gate' 'node' @('--test', (Join-Path $root 'tests\test_agent_browser_gate.cjs'))
 
     $localPython = Join-Path $root '.local\python'
     $env:PYTHONPATH = $localPython

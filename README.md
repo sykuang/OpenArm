@@ -1,6 +1,13 @@
 # OpenArm
 
-Use the manual GitHub Actions workflow to discover popular repositories with
+**Porting goal: native Windows Arm64 support, not x64/x86 emulation.** Repairs must
+produce genuine Arm64 application binaries and runtime dependencies, pass native
+tests, and run the installed application's declared core workflow. Selecting or
+renaming an x64 executable, improving emulation fallback, or passing version/help
+probes does not meet this goal. Missing native dependencies or validation adapters
+remain explicit human blockers, not compatibility-success results.
+
+Use the manual GitHub Actions workflow to discover Trending and Foundational repositories with
 reported Windows Arm64 work or create a documentation-only draft PR inside your
 fork. This read-only discovery/API fork trial uses GitHub's hosted Windows Arm64 runner and installs
 native Copilot CLI; it needs no Azure DevOps setup or self-hosted worker.
@@ -38,7 +45,7 @@ flowchart TD
     K --> L[PR draft artifact: never submit or merge automatically]
 ```
 
-## Discover popular repositories with reported Windows Arm64 work
+## Discover Trending and Foundational repositories
 
 Publish `.github\workflows\github-trial.yml` and the referenced scripts to your
 OpenArm repository's **default branch**. Enable GitHub Actions if repository policy
@@ -71,23 +78,37 @@ Run with **`sourceRepositoryUrl` blank** and **`createForkPullRequest` unchecked
 in the OpenArm repository when discovery needs review or a run fails. Uncheck it
 for a strictly read-only discovery run; the discovery script itself remains
 GET-only and never writes to a target repository.
-The default path automatically lists the **top 20 public, non-archived, non-fork
-GitHub.com repositories by stars**, checks each for open Windows Arm64 issues
-and inspects its latest stable GitHub release assets,
-and recommends the highest-star repository with an explicit support request or
-failure report in an inspected issue title. Download the
+Set **`discoveryTrack`** to **`both`** (the default), `trending`, or `foundational`.
+Trending takes the first ten repositories displayed on
+[GitHub's weekly Trending page](https://github.com/trending?since=weekly), retaining
+the displayed rank and reported weekly-star count. It does not equate lifetime
+stars with recent growth or independently reconstruct star histories.
+Foundational takes up to ten entries from the reviewed
+`targets\discovery\foundational.json` catalog: runtimes, toolchains and shared
+libraries, with a category and explicit rationale for each. Catalog order is a
+curated priority, not a measured dependency ranking or proof of a native gap.
+There is **no minimum lifetime-star threshold**.
+
+The tracks are ranked separately and each can recommend one provisional candidate
+with an explicit native support request or failure report. Overlapping repositories
+are assessed once and retain both source ranks; if both tracks recommend the same
+repository, that is one repair candidate, not two separate porting tasks.
+All selected repositories must be public, non-archived and non-forks. The scan
+checks bounded issue evidence and latest stable GitHub release assets. Download the
 `github-trial-<run-id>-<attempt>` artifact from the workflow run:
-**`discovery.md`** contains the ranking, issue links and release/binary evidence;
-**`discovery.json`** (schema version 2) contains structured assessments, request
-outcomes, timestamps, inspection limits and any failure.
+**`discovery.md`** contains both source rankings, rationales, issue links and binary
+evidence. **`discovery.json`** is now **schema version 3**: `sources` records source
+provenance and HTML/catalog hashes; `recommendations` is an array with at most one
+entry per track, replacing the old singular `recommendation`. Assessments, request
+outcomes, timestamps, inspection limits and failures remain explicit.
 
 Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
 variables > Actions > New repository secret**, using a token issued for
 **GitHub.com** with public read access only; no write
 permissions are needed. Without it, **GitHub Actions uses its existing read-only
 job token** for public discovery, avoiding reliance on the shared runner's
-anonymous quota. The token is passed only to the discovery step; release asset
-downloads remain anonymous. Local runs without this environment variable still
+anonymous quota. The token is passed only to API reads in the discovery step;
+Trending and release asset downloads remain anonymous. Local runs without this environment variable still
 use anonymous public API reads.
 It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
 Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
@@ -95,19 +116,18 @@ Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 can still apply. HTTP errors, rate limits and incomplete responses fail visibly,
 retain partial reports and make **no recommendation**; requests are not retried.
 
-The bounded scan makes 41 API GET requests: one star-ranked repository search and
-one search per repository, `repo:OWNER/REPO is:issue is:open Windows ARM64
-in:title,body`, inspecting up to five most recently updated matches each.
-It then reads `/repos/OWNER/REPO/releases/latest` once per repository; a 404
-records `no_published_release`, not absent support. The core API has a separate
-anonymous limit (normally 60 requests/hour, shared by IP).
-The repository query uses `stars:>=100000 is:public archived:false fork:false`
-to avoid overly broad search timeouts. It requires at least 20 and at most 4,000
-qualifying repositories and exactly 20 correctly ranked results; otherwise it
-fails instead of claiming a complete top 20. This threshold cannot exclude a
-higher-star repository when those conditions hold. Ties keep GitHub's order.
-No language filter is applied, so popular documentation/list repositories remain
-in the ranking. GitHub search is indexed, not a consistent global snapshot.
+The bounded scan makes **at most 60 API GET requests**: repository metadata, one
+issue search and one latest-release read for each of at most twenty unique
+repositories. The issue query remains `repo:OWNER/REPO is:issue is:open Windows
+ARM64 in:title,body`, inspecting up to five most recently updated matches.
+A latest-release 404 records `no_published_release`, not absent support.
+The Trending source adds one anonymous HTML GET, limited to **2 MiB and 30 seconds**
+with no redirects, cookies or credentials. Changed/malformed markup, missing weekly
+counts or source failures stop the scan visibly; it never falls back to a
+lifetime-star ranking. A single-track run avoids fetching the other source.
+The core API has a separate anonymous limit (normally 60 requests/hour, shared by IP).
+No language filter is applied. GitHub metadata and search are not a consistent
+global snapshot; documentation repositories and inapplicable issue matches may remain.
 
 Assessments are `reported_arm64_work`, `needs_review` or
 `no_matching_open_issue` (plus `not_assessed`/`error` on interrupted scans).
@@ -148,20 +168,26 @@ budget limits remain explicitly unverified. These are header observations, not
 signature/integrity checks, proof that every component is Arm64, or a successful
 application launch. An x86 PE header may also belong to managed AnyCPU code.
 
-The recommendation still requires an inspected matching issue and preserves
-star order. Its `workKind` directs review toward an artifact problem, an
+Each recommendation still requires an inspected matching issue and preserves
+its own source order. Its `workKind` directs review toward an artifact problem, an
 existing advertised/observed Arm64 distribution, a possible distribution gap,
 or an unresolved issue with unknown release evidence. Existing Arm64 binaries
 do not suppress a real reported bug; x64-only observations in this bounded
 sample do not establish that an entire repository lacks Arm64 support.
+Before selecting a repair, check existing fixes and identify the repository that
+owns the blocker. If several applications are blocked by one native dependency,
+repair that dependency once. Emulation-only reports require review, not an
+automatic fix. A reproducible native gap, reviewed build/validation adapter and
+genuine Arm64 runtime/core-workflow evidence are required before a repair draft.
 
 Discovery never clones or executes target code, forks a repository, creates a PR
 or generates an unreviewed native target configuration. A blank URL with
-`createForkPullRequest: true` is rejected. To try a reviewed candidate, copy its
-repository URL into a **separate manual run** below; the documentation-only trial
-is not an Arm64 implementation.
+`createForkPullRequest: true` is rejected. A real source repair uses a separately
+reviewed task in the [Copilot repair workflow](#run-copilot-diagnosis-and-reviewed-repairs).
+The URL-based documentation-only trial below is not an Arm64 implementation.
 
 Local read-only equivalent: `.\scripts\Find-Arm64Candidate.ps1`.
+Use `-Track trending` or `-Track foundational` to select one source locally.
 Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are needed;
 `-Output` selects a new report directory and optional `-OutputRoot` bounds it.
 The default output is a unique `out\discovery-*` directory.
@@ -218,22 +244,13 @@ to 64 KiB per UTF-8 file and 128 KiB total. The configured generator, build and
 smoke commands must be appropriate for that reviewed target. This is not a
 universal porting adapter; Python/npm projects need their own reviewed validation.
 
-**Dependency launcher repair: `agent-browser-empty-launcher`.** Copilot, not the
-preparation script, edits only `bin/agent-browser.js` at the pinned v0.37.1 source.
-The adapter downloads the SHA256-pinned published package through the npm feed
-proxy without executing install scripts. It checks that the published wrapper
-matches the source and extracts only the wrapper, package metadata and x64 PE.
-On native Windows Arm64 Node.js, both preparation and independent validation
-compare clean-package `--version`/`--help` with an explicitly constructed
-zero-byte Arm64-file regression fixture. This does **not** establish that a clean
-v0.37.1 install creates the file or that it survives upgrades. Trusted launcher
-contracts cover missing/empty/directory paths, native preference, platform
-selection, arguments, exit codes and visible errors; they are not agent-editable.
-No x64 executable is relabeled Arm64. A passing candidate has status
-`compatibility_validated` and `nativeVerified: false`: **x64 emulation on an
-Arm64 host**, not a native port or a working browser session. This dependency
-task currently publishes no PR, even with `publishDraft: true`; its correct
-destination fork and publishing access require separate authorization.
+**Retired emulation repair: `agent-browser-empty-launcher`.** This task ID is now
+**diagnosis-only** with no editable files. The x64-fallback adapter has been removed;
+existing compatibility artifacts and draft PRs are historical, not native-porting
+evidence. Future agent-browser repair requires a reviewed native build/packaging
+adapter, Arm64 runtime dependencies, nonempty tests and an actual installed browser
+workflow. Until then, diagnosis returns `needs_human`; neither an edit nor a PR is
+allowed, even with `publishDraft: true`.
 
 The jobs deliberately separate capabilities:
 
