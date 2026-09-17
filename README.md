@@ -266,6 +266,18 @@ field alone does not identify a hybrid DLL's native execution view. The correcte
 audit above requires actual native dependency evidence instead of treating every
 incidental interpreter file as a NumPy dependency. The historical run is not a
 reproduced NumPy crash or evidence of emulation; it produced no native draft.
+
+The [corrected native run](https://github.com/sykuang/OpenArm/actions/runs/35215843735)
+passed all eight cases for **both 2.3.2 and 2.5.3**: 1,600 inverse operations in
+total, with native OS/process checks, all 23 wheel binaries per version at
+**0xAA64**, and all 57 distinct observed loaded modules exposing **0xAA64** views.
+`vcruntime140_1.dll` appeared in neither the before/after module snapshots. This
+does not reproduce #29442 on these workers or establish that every environment
+is unaffected. The [updated discovery run](https://github.com/sykuang/OpenArm/actions/runs/35215842450)
+now skips #29442 because merged PRs #31649 and #31704 reference it as a possible
+fix; it recommends the separate #30089 condition-number report for investigation.
+Neither passing inverse tests nor existing upstream work justifies a new NumPy
+source-repair draft. The condition-number report is not covered by this fixture.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
