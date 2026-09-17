@@ -47,12 +47,14 @@ try {
             Where-Object Extension -in '.ps1', '.py', '.cjs', '.cpp', '.txt'
         Get-Item -LiteralPath (Join-Path $root 'azure-pipelines.yml'), (Join-Path $root 'azure-pipelines-ci.yml'),
             (Join-Path $root '.github\workflows\github-trial.yml'), (Join-Path $root '.github\workflows\copilot-repair.yml'),
+            (Join-Path $root '.github\workflows\numpy-reproduction.yml'),
             (Join-Path $root '.github\skills\windows-arm64-porting\SKILL.md'),
             (Join-Path $root '.github\agents\windows-arm64-porting.agent.md'),
             (Join-Path $root 'native-stage.yml'),
             (Join-Path $root 'requirements-dev.txt'), (Join-Path $root 'targets\smoke.json')
         Get-ChildItem -LiteralPath (Join-Path $root 'targets\github') -Filter *.json
         Get-ChildItem -LiteralPath (Join-Path $root 'targets\discovery') -Filter *.json
+        Get-ChildItem -LiteralPath (Join-Path $root 'targets\numpy-repro') -Filter *.txt
     )
     $report.sourceFiles = @($files | Sort-Object FullName -Unique | ForEach-Object {
         @{ path = [IO.Path]::GetRelativePath($root, $_.FullName)
@@ -77,6 +79,7 @@ try {
     }
     Invoke-Check 'python-version' $Python @('-c', 'import yaml; print("PyYAML " + yaml.__version__); assert yaml.__version__ == "6.0.3", "Use the pinned requirements-dev.txt version"')
     Invoke-Check 'pipeline-yaml' $Python @((Join-Path $root 'tests\test_pipeline.py'))
+    Invoke-Check 'numpy-reproduction' $Python @((Join-Path $root 'tests\test_numpy_reproduction.py'))
 
     $cmakePath = (Get-Command $CMake -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $ctest = Join-Path (Split-Path $cmakePath -Parent) 'ctest.exe'

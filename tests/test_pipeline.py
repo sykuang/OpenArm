@@ -1,6 +1,7 @@
 """Offline Azure Pipeline and GitHub Actions wiring checks, not cloud execution."""
 from pathlib import Path
 import json
+import re
 import subprocess
 import unittest
 import yaml
@@ -396,6 +397,32 @@ class PipelineChecks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("20 human-help issue checks passed.", result.stdout)
+
+    def test_numpy_reproduction_is_native_read_only_and_bounded(self):
+        workflow = load(ROOT / ".github" / "workflows" / "numpy-reproduction.yml")
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"reproduce"})
+        job = workflow["jobs"]["reproduce"]
+        self.assertEqual(job["runs-on"], "windows-11-arm")
+        self.assertEqual(job["timeout-minutes"], 15)
+        self.assertEqual(job["strategy"]["matrix"]["numpy"], ["2.3.2", "2.5.3"])
+        self.assertIs(job["strategy"]["fail-fast"], False)
+        steps = job["steps"]
+        self.assertIs(steps[0]["with"]["persist-credentials"], False)
+        self.assertEqual(steps[2]["with"], {"python-version": "3.12.10", "architecture": "arm64"})
+        self.assertIn("--require-hashes", steps[3]["run"])
+        self.assertIn("--only-binary=:all:", steps[3]["run"])
+        self.assertIn("Get-PeMachine", steps[3]["run"])
+        self.assertEqual(steps[-1]["if"], "${{ always() }}")
+        self.assertEqual(steps[-1]["with"]["if-no-files-found"], "error")
+        self.assertNotIn("secrets.", json.dumps(workflow))
+        for step in steps:
+            if "uses" in step:
+                self.assertRegex(step["uses"], r"@[a-f0-9]{40}$")
+        for version in job["strategy"]["matrix"]["numpy"]:
+            requirement = (ROOT / "targets" / "numpy-repro" / f"{version}.txt").read_text().strip()
+            self.assertRegex(requirement, rf"^numpy=={re.escape(version)} --hash=sha256:[a-f0-9]{{64}}$")
 
 
 if __name__ == "__main__":

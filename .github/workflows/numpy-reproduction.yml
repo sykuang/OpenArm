@@ -1,0 +1,61 @@
+name: Native NumPy inverse reproduction
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        numpy: ['2.3.2', '2.5.3']
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out trusted reproduction harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify native Windows Arm64 worker
+        run: |
+          if (-not $IsWindows -or
+              [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64' -or
+              [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') {
+            throw 'Native Windows Arm64 and native PowerShell are required.'
+          }
+          $null = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\numpy-reproduction"
+      - name: Set up the reported native Python version
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+          architecture: arm64
+      - name: Install the hash-pinned native wheel
+        env:
+          NUMPY_VERSION: ${{ matrix.numpy }}
+        run: |
+          . .\scripts\Common.ps1
+          if ((Get-PeMachine (Get-Command python -CommandType Application).Source) -ne 0xAA64) {
+            throw 'Python is not a native Arm64 executable.'
+          }
+          python -m pip install --disable-pip-version-check --no-input --no-deps --only-binary=:all: --require-hashes --force-reinstall -r ".\targets\numpy-repro\$env:NUMPY_VERSION.txt" *> "$env:RUNNER_TEMP\numpy-reproduction\install.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned NumPy wheel installation failed; see install.log.' }
+      - name: Exercise the exact inverse fixture with two worker processes
+        env:
+          NUMPY_VERSION: ${{ matrix.numpy }}
+        run: |
+          python .\scripts\numpy_reproduction.py --version $env:NUMPY_VERSION --output "$env:RUNNER_TEMP\numpy-reproduction\cases"
+          if ($LASTEXITCODE -ne 0) { throw 'Native inverse reproduction failed; inspect result.json and case logs.' }
+      - name: Preserve native reproduction evidence including failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: numpy-reproduction-${{ matrix.numpy }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\numpy-reproduction
+          if-no-files-found: error
+          retention-days: 7

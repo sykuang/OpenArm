@@ -208,6 +208,31 @@ Use `-Track trending` or `-Track foundational` to select one source locally.
 Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are needed;
 `-Output` selects a new report directory and optional `-OutputRoot` bounds it.
 The default output is a unique `out\discovery-*` directory.
+
+### Reproduce the next native candidate before repairing
+
+The manual **Native NumPy inverse reproduction** workflow tests
+[NumPy #29442](https://github.com/numpy/numpy/issues/29442) on `windows-11-arm`,
+using the report's native Python **3.12.10** and separate jobs for the reported
+**2.3.2** wheel and current **2.5.3** wheel. `targets\numpy-repro\*.txt` pins the
+exact PyPI `cp312-cp312-win_arm64` wheel hashes. It does not edit NumPy, call an
+AI agent, create a fork/PR or consume a publishing secret.
+
+`scripts\numpy_reproduction.py` checks the native OS/process and PE headers/hashes
+of the installed Python/NumPy runtime EXE, DLL and PYD files, then exercises the
+issue's seed, 20-by-20 matrix, complex64/complex128 and symmetric/hermitian inputs.
+Float32/float64 controls are included. Two child processes run at a time, each
+performing 100 inversions and checking the inverse residual, with a 120-second
+per-case limit. An access-violation exit code is distinguished from numerical
+failure, setup failure, timeout and missing completion evidence.
+
+Download both `numpy-reproduction-<version>-<run-id>-<attempt>` artifacts, including
+failed jobs. They contain the install log, runtime binary inventory, per-case logs
+and `cases\result.json`. This is **wheel reproduction, not a native source repair**.
+A passing current wheel does not prove that older wheels or other workflows work;
+an old-only failure is not a reason to invent a new source fix. A reproduced
+current failure still needs dependency ownership and a reviewed source-build
+adapter before the Copilot repair workflow can generate a genuine native draft.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
