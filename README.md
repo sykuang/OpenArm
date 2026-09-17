@@ -137,7 +137,7 @@ repository set and all four review surfaces; invalid source/passage references,
 missing results, authentication errors or failed batches fail the review visibly.
 No partial batch sequence is reported as a successful empty recommendation set.
 
-**Only explicitly reported native gaps can be recommended.** A finding needs
+**Only corroborated, explicitly reported native gaps can be recommended.** A recommendation needs
 exact quotes from at least two distinct supplied sources, including an explicit
 Windows Arm64 missing/unsupported/degraded-support statement and corroborating
 README, release or source evidence. An empty search or absent asset alone is not
@@ -147,6 +147,11 @@ at most one eligible candidate per source track; all assessments remain visible.
 Copilot selects numbered passages rather than generating quote text. The validator
 copies those bounded passages directly from the collected source, preserving
 Markdown and Unicode and preventing paraphrases from becoming purported quotations.
+Single-source reports remain visible as `uncorroborated_report`, with a review
+warning and no recommendation; they do not abort unrelated repository reviews.
+If the cited passages do not even establish the model-labelled native gap, it is
+retained as `unknown` with `no_explicit_gap_citation`, the original model label and
+an explicit warning. Invalid JSON, repository sets or source references still fail.
 
 `targets\discovery\distribution-channels.json` still supplies reviewed official
 registry evidence without guessing package names. NumPy's `win_arm64` wheels
@@ -162,7 +167,8 @@ adds Hermes staging/package text and the upstream `sindresorhus/get-windows`
 README, package, issues, PRs and latest release. Hermes staging documents missing
 Windows Arm64 prebuilds and a disabled window-enumeration path; that is not proof
 that native source compilation is impossible, or that a patch has been validated.
-The focused result is retained in `focusFindings`, even if upstream work remains
+The focus is reviewed first, separately from the ranked batches. Its result is
+retained in `focusFindings`, even if upstream work remains
 uncertain. If Hermes is absent from Trending/Foundational, it is explicitly an
 additional reference check, not an invented rank in the 100-repository pool.
 The default `reviewFocus: none` does not add a reference repository.

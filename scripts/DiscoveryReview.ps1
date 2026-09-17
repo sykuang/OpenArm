@@ -296,9 +296,12 @@ Return exactly one entry per DATA repository, in any order, using this shape:
 For a dependency use {"name":"package name","repository":"owner/repo or null"} instead of null.
 Use 0-5 citations. Select the exact integer number of a supplied passage in that document.
 Do NOT generate, paraphrase or copy quotes: the caller copies the chosen source passage verbatim.
-For reported_missing_native_support cite at least TWO distinct source documents. One selected
-passage must explicitly report missing/unsupported/degraded Windows Arm64 native support, with
-corroborating README, release or source evidence. An absent asset alone is not such a statement.
+For reported_missing_native_support cite an explicit missing/unsupported/degraded Windows Arm64
+native-support statement. Cite independent corroboration when available; otherwise say the report
+is unconfirmed. The caller will not recommend a report lacking two distinct cited sources including
+README, release or source corroboration. An absent asset alone is not a missing-support statement.
+Making native converters optional, dropping them, or disabling a feature is a workaround, not a
+native dependency fix. Do not invent dependency owners from memory; use null when not identified.
 If support is merely unknown, return unknown rather than inventing a porting candidate.
 Do not infer dependency ownership unless the supplied evidence identifies it.
 Focus question (if any): $Question
@@ -365,15 +368,25 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
             $citation.kind = $document.kind
             $cited[$document.id] = $document
         }
+        $item.evidenceStatus = 'not_a_reported_gap'
+        $item.reviewWarning = $null
         if ($item.assessment -eq 'reported_missing_native_support') {
             $explicit = @($item.citations | Where-Object {
                 $_.quote -match '(?i)\b(?:windows|win32|win[-_]arm64)\b' -and
                 $_.quote -match '(?i)\b(?:arm64|aarch64)\b' -and
                 $_.quote -match '(?i)\b(?:missing|no|not|unsupported|only|absent|disable\w*|unavailable|skip\w*|lack\w*)\b'
             })
-            if ($cited.Count -lt 2 -or -not $explicit.Count -or
+            if (-not $explicit.Count) {
+                $item.modelAssessment = $item.assessment
+                $item.assessment = 'unknown'
+                $item.evidenceStatus = 'no_explicit_gap_citation'
+                $item.reviewWarning = 'The model-labelled gap is not established by the cited Windows Arm64 passages; it remains unknown.'
+            } elseif ($cited.Count -lt 2 -or
                 -not @($cited.Values | Where-Object kind -in @('readme', 'release', 'source')).Count) {
-                throw "The missing-support finding for $($item.fullName) lacks explicit, corroborated Windows Arm64 evidence."
+                $item.evidenceStatus = 'uncorroborated_report'
+                $item.reviewWarning = 'This source reports a native gap, but independent README/release/source corroboration is missing; human review is required.'
+            } else {
+                $item.evidenceStatus = 'corroborated_report'
             }
         }
         $item.provisional = $true
@@ -384,7 +397,8 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
         $item.eligible = $false
         $item.eligibilityReason = 'not_a_missing_support_finding'
         if ($item.assessment -eq 'reported_missing_native_support') {
-            $item.eligibilityReason = if ($item.upstreamDisposition -in @('active_native_fix', 'merged_native_fix')) { 'existing_native_fix_requires_review' }
+            $item.eligibilityReason = if ($item.evidenceStatus -ne 'corroborated_report') { 'missing_independent_corroboration' }
+                elseif ($item.upstreamDisposition -in @('active_native_fix', 'merged_native_fix')) { 'existing_native_fix_requires_review' }
                 elseif ($item.upstreamDisposition -eq 'unknown' -or $repository.coverage.pullRequestsTruncated -ne $false -or
                     ($repository.dependency -and $repository.dependency.coverage.pullRequestsTruncated -ne $false)) { 'upstream_work_not_fully_assessed' }
                 elseif ($item.scope -eq 'project' -and $repository.nativeSupport -eq 'native_distribution_available') { 'project_already_advertises_native_distribution' }

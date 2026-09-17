@@ -19,6 +19,7 @@ $report = @{
     nativeVerified = $false; authVerified = $false; sourceDiscoverySha256 = $null
     citationMode = 'numbered_source_passages'
     focus = $Focus; rankedCount = 0; requestedCount = 0; assessedCount = 0
+    reviewWarningCount = 0
     requests = @(); batches = @(); assessments = @(); recommendations = @(); focusFindings = @()
     limits = @{ maxRankedRepositories = 100; maxFocusRepositories = 1; maxDependencyRepositories = 1
         maxPreparationRequests = 150; maxRepositoriesPerPrompt = 10; maxAgentCalls = 11
@@ -27,7 +28,7 @@ $report = @{
         'All results are provisional analysis of public text, not native builds or execution proof.'
         'Every ranked repository is reviewed, including unconfigured distribution channels and non-matching issue titles.'
         'README text is bounded to 6,000 characters; issue and PR text to about 2,000 each. Excerpts retain hashes and truncation. Only five matching issues and five PRs per repository are included.'
-        'Missing matches, truncated evidence or absent packages alone do not prove missing native support.'
+        'Missing matches, truncated evidence or absent packages alone do not prove missing native support. Uncorroborated reports remain explicit human follow-ups, not recommendations or fatal schema errors.'
         'A native parent installer cannot prove that an optional native dependency or disabled feature works. Source-build feasibility still requires native reproduction.'
         'Open/merged native fixes exclude duplicate recommendations; merged disabled-feature/emulation workarounds are not native fixes. Incomplete PR searches require human review.'
         'The named focus is outside the ranked pool unless independently present there; it never invents a source rank.'
@@ -52,6 +53,7 @@ function Save-ReviewMarkdown {
     $lines.Add("Status: **$($report.status)**. Reviewed $($report.assessedCount)/$($report.requestedCount) repositories; $($report.rankedCount) belong to the ranked source pool.")
     $lines.Add('This is the content-review report. The earlier discovery report is evidence collection, not the final recommendation queue.')
     $lines.Add("Focus: $(ConvertTo-ReviewMarkdown $report.focus). Native execution verified: **false**.")
+    $lines.Add("Reports requiring evidence follow-up: $($report.reviewWarningCount). Unconfirmed reports are not recommendations.")
     if ($report.error) { $lines.Add("Error: $(ConvertTo-ReviewMarkdown $report.error)") }
     foreach ($candidate in $report.recommendations) {
         $lines.Add("- $($candidate.track) provisional candidate: [$($candidate.fullName)](https://github.com/$($candidate.fullName)); scope $($candidate.scope).")
@@ -64,8 +66,9 @@ function Save-ReviewMarkdown {
     foreach ($item in $report.assessments) {
         if ($item.assessment -ne 'reported_missing_native_support' -and $item.fullName -notin @($report.focusFindings | ForEach-Object fullName)) { continue }
         $lines.Add("### $($item.fullName)")
-        $lines.Add("Assessment: $($item.assessment); scope $($item.scope); upstream $($item.upstreamDisposition); eligibility $($item.eligibilityReason).")
+        $lines.Add("Assessment: $($item.assessment); evidence $($item.evidenceStatus); scope $($item.scope); upstream $($item.upstreamDisposition); eligibility $($item.eligibilityReason).")
         $lines.Add((ConvertTo-ReviewMarkdown $item.reason))
+        if ($item.reviewWarning) { $lines.Add("Review warning: $(ConvertTo-ReviewMarkdown $item.reviewWarning)") }
         if ($item.dependency) { $lines.Add("Dependency: $(ConvertTo-ReviewMarkdown $item.dependency.name); owner $(ConvertTo-ReviewMarkdown $item.dependency.repository).") }
         foreach ($citation in $item.citations) {
             $lines.Add("- [$(ConvertTo-ReviewMarkdown $citation.sourceId)]($($citation.url)): $(ConvertTo-ReviewMarkdown $citation.quote)")
@@ -73,10 +76,10 @@ function Save-ReviewMarkdown {
     }
     $lines.Add('')
     $lines.Add('## All repository assessments')
-    $lines.Add('| Repository | Review scope | Assessment | Native gap scope | Upstream disposition |')
-    $lines.Add('| --- | --- | --- | --- | --- |')
+    $lines.Add('| Repository | Review scope | Assessment | Evidence status | Native gap scope | Upstream disposition |')
+    $lines.Add('| --- | --- | --- | --- | --- | --- |')
     foreach ($item in $report.assessments) {
-        $lines.Add("| $($item.fullName) | $($item.reviewScope) | $($item.assessment) | $($item.scope) | $($item.upstreamDisposition) |")
+        $lines.Add("| $($item.fullName) | $($item.reviewScope) | $($item.assessment) | $($item.evidenceStatus) | $($item.scope) | $($item.upstreamDisposition) |")
     }
     $lines.Add('')
     $lines.Add('## Limits')
@@ -165,9 +168,9 @@ try {
         $workspace = Join-Path $Output 'workspace'
         $null = New-Item -ItemType Directory -Path $workspace
         $batches = [Collections.Generic.List[object]]::new()
+        if ($context.focusRepository) { $batches.Add(@($context.repositories | Where-Object fullName -eq $context.focusRepository)) }
         $normal = @($context.repositories | Where-Object fullName -ne $context.focusRepository)
         for ($i = 0; $i -lt $normal.Count; $i += 10) { $batches.Add(@($normal | Select-Object -Skip $i -First 10)) }
-        if ($context.focusRepository) { $batches.Add(@($context.repositories | Where-Object fullName -eq $context.focusRepository)) }
         if ($batches.Count -gt 11) { throw 'Copilot review exceeded eleven bounded calls.' }
         foreach ($batch in $batches) {
             $number = $report.batches.Count + 1
@@ -189,6 +192,11 @@ try {
             $report.authVerified = $true
             $items = @(ConvertFrom-DiscoveryReview (Get-Content -LiteralPath $log -Raw) $batch)
             $report.assessments += $items
+            foreach ($item in $items) {
+                if ($item.reviewWarning) { Write-Warning "$($item.fullName): $($item.reviewWarning)" }
+            }
+            $report.reviewWarningCount = @($report.assessments | Where-Object reviewWarning).Count
+            $report.focusFindings = @($report.assessments | Where-Object fullName -eq $context.focusRepository)
             $report.assessedCount += $items.Count
             $receipt.usageSha256 = (Get-FileHash -LiteralPath $usage -Algorithm SHA256).Hash.ToLowerInvariant()
             $receipt.status = 'completed'
@@ -205,7 +213,6 @@ try {
                 $report.recommendations += $recommendation
             }
         }
-        $report.focusFindings = @($report.assessments | Where-Object fullName -eq $context.focusRepository)
         $report.status = 'completed'
     }
 } catch {

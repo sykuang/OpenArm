@@ -195,13 +195,13 @@ try {
         ($hermes.documents | Where-Object kind -eq 'pull_request').details.state -eq 'MERGED') 'A native parent package does not erase the dependency, and merged workaround bodies are preserved'
     $focusReview = Run-Review 'reviewed-focus' 'Agent' $focusPrepared.output
     Assert (-not $focusReview.error -and $focusReview.report.assessedCount -eq 101 -and
-        $global:ReviewMock.agentCalls.Count -eq 11 -and $global:ReviewMock.agentCalls[-1].count -eq 1) "The named focus receives its own content review without changing the ranked 100: $($focusReview.error)"
+        $global:ReviewMock.agentCalls.Count -eq 11 -and $global:ReviewMock.agentCalls[0].count -eq 1) "The named focus receives priority content review without changing the ranked 100: $($focusReview.error)"
     $finding = $focusReview.report.focusFindings[0]
     Assert ($finding.assessment -eq 'reported_missing_native_support' -and $finding.scope -eq 'dependency' -and $finding.eligible -and
         $finding.upstreamDisposition -eq 'workaround_only' -and $finding.citations.Count -eq 2 -and
         $focusReview.report.recommendations.Count -eq 0) 'Disabling window enumeration is a reported native dependency gap, not an invented ranked candidate or a native fix'
-    Assert ($global:ReviewMock.agentCalls[0].prompt -notlike '*Focus question (if any): Does Hermes*' -and
-        $global:ReviewMock.agentCalls[-1].prompt -like '*Focus question (if any): Does Hermes*') 'The special focus does not bias unrelated repository batches'
+    Assert ($global:ReviewMock.agentCalls[-1].prompt -notlike '*Focus question (if any): Does Hermes*' -and
+        $global:ReviewMock.agentCalls[0].prompt -like '*Focus question (if any): Does Hermes*') 'The special focus does not bias unrelated repository batches'
     $markdown = Get-Content "$($focusReview.output)\copilot-review.md" -Raw
     Assert ($markdown -like '*sindresorhus/get-windows*' -and $markdown -like '*window enumeration*' -and $markdown -like '*native Windows Arm64*') 'Final readable evidence explains the dependency instead of reporting a false empty success'
 
@@ -237,14 +237,24 @@ try {
     $answer.citations[0].quote = 'A model-generated paraphrase must never replace the actual source.'
     $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].citations[0].quote -ceq $global:ReviewMock.stageText) 'Only the selected original passage, never model-generated quote text, enters the report'
-    foreach ($case in 'passage', 'passage-type', 'foreign-source', 'one-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository') {
+    $answer = New-Assessment $hermes
+    $answer.citations = @($answer.citations[0])
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    Assert ($result[0].assessment -eq 'reported_missing_native_support' -and $result[0].evidenceStatus -eq 'uncorroborated_report' -and
+        -not $result[0].eligible -and $result[0].reviewWarning) 'A genuine one-source report is retained as explicitly unconfirmed without aborting unrelated reviews'
+    $answer = New-Assessment $hermes
+    $answer.citations = @($answer.citations[1])
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    Assert ($result[0].assessment -eq 'unknown' -and $result[0].evidenceStatus -eq 'no_explicit_gap_citation' -and
+        -not $result[0].eligible -and $result[0].modelAssessment -eq 'reported_missing_native_support' -and
+        $result[0].reviewWarning) 'A model-labelled gap without an explicit source statement is visibly rejected, not silently promoted'
+    foreach ($case in 'passage', 'passage-type', 'foreign-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository') {
         $answer = New-Assessment $hermes
         $payload = @{ schemaVersion = 2; repositories = @($answer) }
         switch ($case) {
             'passage' { $answer.citations[0].passage = 9999 }
             'passage-type' { $answer.citations[0].passage = '1' }
             'foreign-source' { $answer.citations[0].sourceId = 'other/project/issue-1' }
-            'one-source' { $answer.citations = @($answer.citations[0]) }
             'owner' { $answer.dependency.repository = 'unrelated/owner' }
             'missing-surface' { $answer.reviewedSurfaces = @('readme') }
             'duplicate' { $payload.repositories += $answer }
@@ -262,6 +272,11 @@ try {
     Assert ($failed.error -and $failed.report.status -eq 'failed' -and $failed.report.assessedCount -eq 10 -and
         $failed.report.recommendations.Count -eq 0 -and $global:ReviewMock.agentCalls.Count -eq 2 -and
         $failed.report.batches[-1].status -eq 'failed') 'A later AI failure preserves ten reviews but emits no successful recommendation set or retry'
+    Reset-Mock
+    $global:ReviewMock.agentFailAt = 2
+    $failed = Run-Review 'focus-survives-later-failure' 'Agent' $focusPrepared.output
+    Assert ($failed.error -and $failed.report.status -eq 'failed' -and $failed.report.assessedCount -eq 1 -and
+        $failed.report.focusFindings.Count -eq 1 -and $failed.report.recommendations.Count -eq 0) 'The specifically requested focus survives a later batch failure without claiming overall success'
     $env:GITHUB_ACTIONS = 'false'
     $failed = Run-Review 'agent-local-blocked' 'Agent' $prepared.output
     Assert ($failed.error -like '*only inside the GitHub Action*' -and $global:ReviewMock.agentCalls.Count -eq 2) 'Tests and local preparation never silently invoke paid AI'
