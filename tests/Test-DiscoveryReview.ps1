@@ -202,6 +202,15 @@ try {
         $focusReview.report.recommendations.Count -eq 0) 'Disabling window enumeration is a reported native dependency gap, not an invented ranked candidate or a native fix'
     Assert ($global:ReviewMock.agentCalls[-1].prompt -notlike '*Focus question (if any): Does Hermes*' -and
         $global:ReviewMock.agentCalls[0].prompt -like '*Focus question (if any): Does Hermes*') 'The special focus does not bias unrelated repository batches'
+    $focusPrompt = $global:ReviewMock.agentCalls[0].prompt
+    $requestedNames = @([regex]::Match($focusPrompt, '(?m)^REQUESTED_REPOSITORIES: (.+)$').Groups[1].Value | ConvertFrom-Json)
+    Assert (@($requestedNames).Count -eq 1 -and $requestedNames[0] -ceq 'NousResearch/hermes-agent' -and
+        $focusPrompt -like '*do NOT return extra entries for nested dependencies*') 'The focus prompt explicitly requests only its root, while retaining upstream dependency evidence'
+    $normalNames = [regex]::Match($global:ReviewMock.agentCalls[-1].prompt, '(?m)^REQUESTED_REPOSITORIES: (.+)$').Groups[1].Value | ConvertFrom-Json
+    Assert (@($normalNames).Count -eq 10 -and
+        (@($normalNames | Sort-Object) -join ',') -ceq (@($global:ReviewMock.agentCalls[-1].names | Sort-Object) -join ',')) 'Every ranked batch names its exact output repository set independently of nested context'
+    $extraDependency = New-Assessment $hermes.dependency
+    Assert-Throws { ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @((New-Assessment $hermes), $extraDependency) } | ConvertTo-Json -Depth 12) @($hermes) } '*exact requested repository set*'
     $markdown = Get-Content "$($focusReview.output)\copilot-review.md" -Raw
     Assert ($markdown -like '*sindresorhus/get-windows*' -and $markdown -like '*window enumeration*' -and $markdown -like '*native Windows Arm64*') 'Final readable evidence explains the dependency instead of reporting a false empty success'
 

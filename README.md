@@ -167,7 +167,9 @@ adds Hermes staging/package text and the upstream `sindresorhus/get-windows`
 README, package, issues, PRs and latest release. Hermes staging documents missing
 Windows Arm64 prebuilds and a disabled window-enumeration path; that is not proof
 that native source compilation is impossible, or that a patch has been validated.
-The focus is reviewed first, separately from the ranked batches. Its result is
+The focus is reviewed first, separately from the ranked batches. Each prompt lists
+the exact requested repository names; nested dependency evidence informs its
+parent's assessment rather than adding an extra result or a ranked candidate. Its result is
 retained in `focusFindings`, even if upstream work remains
 uncertain. If Hermes is absent from Trending/Foundational, it is explicitly an
 additional reference check, not an invented rank in the 100-repository pool.
