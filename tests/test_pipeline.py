@@ -414,6 +414,11 @@ class PipelineChecks(unittest.TestCase):
         self.assertIn("--require-hashes", steps[3]["run"])
         self.assertIn("--only-binary=:all:", steps[3]["run"])
         self.assertIn("Get-PeMachine", steps[3]["run"])
+        self.assertIn("worker.json", steps[1]["run"])
+        self.assertNotIn("Get-Command", steps[3]["run"])
+        for step in steps[3:5]:
+            self.assertIn("Join-Path $env:pythonLocation 'python.exe'", step["run"])
+            self.assertIn("& $python ", step["run"])
         self.assertEqual(steps[-1]["if"], "${{ always() }}")
         self.assertEqual(steps[-1]["with"]["if-no-files-found"], "error")
         self.assertNotIn("secrets.", json.dumps(workflow))
