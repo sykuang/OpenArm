@@ -9,11 +9,13 @@ remain explicit human blockers, not compatibility-success results.
 
 Use the manual GitHub Actions workflow to discover Trending and Foundational repositories with
 reported Windows Arm64 work or create a documentation-only draft PR inside your
-fork. This read-only discovery/API fork trial uses GitHub's hosted Windows Arm64 runner and installs
-native Copilot CLI; it needs no Azure DevOps setup or self-hosted worker.
+fork. Discovery now uses **Copilot CLI inside the Action** to review README text,
+issue/PR bodies and states, releases and supplied dependency evidence for every
+selected repository. It uses GitHub's hosted Windows Arm64 runner; no Azure DevOps
+setup or self-hosted worker is needed.
 
-The separate **Copilot diagnosis and reviewed repair** workflow makes actual AI
-requests. It defaults to diagnosis of the Hermes browser report, not an invented
+The separate **Copilot diagnosis and reviewed repair** workflow also makes AI
+requests, but can act only on a separately reviewed repair task. It defaults to diagnosis of the Hermes browser report, not an invented
 port. Reviewed CMake targets can use a bounded edit, independent native validation
 and opt-in draft-PR publisher. See [Copilot setup](#run-copilot-diagnosis-and-reviewed-repairs).
 
@@ -67,17 +69,21 @@ Any setup/architecture/version failure stops the trial and can trigger the
 human-help issue job. See the [official runner image](https://github.com/actions/runner-images/blob/main/images/windows/Windows11-Arm64-Readme.md)
 and [Copilot CLI installation documentation](https://github.com/github/copilot-cli#installation).
 
-**Installing the CLI does not invoke AI.** This workflow does not send a prompt,
-request Copilot permissions, consume Copilot requests or claim to repair a
-target. Actual AI repair still needs an explicit task, Copilot entitlement and a
-reviewed target/build-validation path. Selecting an Arm64 runner and checking the
-CLI are not proof of the target application's native compatibility.
+**Blank-URL discovery now invokes AI, not just `copilot --version`.** After evidence
+collection, a separate native Arm64 `review` job runs the CLI with the Actions
+`GITHUB_TOKEN` and `copilot-requests: write`. Copilot access/entitlement is required.
+It reviews up to ten repositories per call: ten calls for the normal 100-repository
+pool, at most eleven with a named focus, each limited to 180 seconds without retries.
+Only that job grants Copilot access; the collector has public read access and the
+reviewer never receives the fork-publishing secret. A nonblank URL still runs the
+API fork trial without AI. Neither content review nor the CLI architecture check
+proves native application compatibility or authorizes a repair.
 
 Run with **`sourceRepositoryUrl` blank** and **`createForkPullRequest` unchecked**.
 **`createHumanHelpIssue` is checked by default**: the workflow creates an issue
 in the OpenArm repository when discovery needs review or a run fails. Uncheck it
-for a strictly read-only discovery run; the discovery script uses REST GETs and
-bounded GraphQL query POSTs, never mutations or target repository writes.
+to avoid repository writes; discovery uses REST GETs and bounded GraphQL queries,
+and its separate Copilot review consumes AI requests but never edits target code.
 Set **`discoveryTrack`** to **`both`** (the default), `trending`, or `foundational`.
 The default scan selects **100 distinct repositories total**, not 100 per track.
 Trending starts with [GitHub's global weekly Trending page](https://github.com/trending?since=weekly),
@@ -108,7 +114,7 @@ repository, that is one repair candidate, not two separate porting tasks.
 All selected repositories must be public, non-archived and non-forks. The scan
 checks bounded issue evidence, latest stable GitHub release assets and reviewed
 official package-registry channels. Download the
-`github-trial-<run-id>-<attempt>` artifact from the workflow run:
+`github-trial-<run-id>-<attempt>` collection artifact from the workflow run:
 **`discovery.md`** contains both source rankings, rationales, issue links and binary
 evidence. **`discovery.json`** is now **schema version 4**, with
 `selectionMode: missing_native_support_only`, per-repository `nativeSupport`
@@ -116,25 +122,54 @@ evidence and a distribution-catalog hash. `maxRepositories`, `requestedCount` an
 `selectionShortfall` distinguish the total budget from actual source coverage.
 `sources` retains per-page URL, language, timestamp, hash and count provenance;
 `trendingEvidence` preserves each repository's first page and displayed rank.
-`recommendations` remains an array with at most one entry per track. Assessments,
-request outcomes, timestamps, inspection limits and failures remain explicit.
+The Action collects with `-EvidenceOnly`: `reviewStatus: awaiting_copilot_review`
+and no heuristic recommendations. Assessments, request outcomes, timestamps,
+inspection limits and failures remain explicit.
 
-**Existing native distributions, ordinary native-support bugs, and unknown support
-are excluded from recommendations.** `targets\discovery\distribution-channels.json`
-records reviewed official channels; registry package names are not guessed from
-repository names. It currently maps NumPy and gRPC to their official PyPI packages,
-and Ninja/ccache to GitHub releases. Other repositories stay visible in the source
-inventory, but cannot be recommended as missing until their relevant distribution
-channels are reviewed. This deliberately trades recall for avoiding false porting
-tasks; an unreviewed Trending project is not assumed to distribute only on GitHub.
+The **final content review** is in
+`discovery-copilot-review-<run-id>-<attempt>`: `copilot-review.md`, `report.json`,
+and per-batch prompts, CLI logs and usage receipts. The
+`discovery-review-context-<run-id>-<attempt>` artifact preserves the prepared
+public text, source URLs, file/blob hashes, PR states and truncation indicators.
+Every selected repository is sent to Copilot, **not just title matches or
+repositories in the distribution catalog**. Each response must cover its exact
+repository set and all four review surfaces; fabricated source IDs/quotes,
+missing results, authentication errors or failed batches fail the review visibly.
+No partial batch sequence is reported as a successful empty recommendation set.
 
-Every recommendation requires an explicit missing-support issue, completed
-reviewed-channel evidence corroborating that gap, and a clear upstream-work check.
-Any observed/advertised Windows Arm64 distribution vetoes a new-port recommendation,
-including one found on GitHub outside the configured registry channel. NumPy's
-`win_arm64` PyPI wheels therefore exclude it even if GitHub has only source assets
-or an old request still asks for Windows Arm64 support. An existing artifact with
-a crash, bad label or empty payload belongs to separate bug triage, not this queue.
+**Only explicitly reported native gaps can be recommended.** A finding needs
+exact quotes from at least two distinct supplied sources, including an explicit
+Windows Arm64 missing/unsupported/degraded-support statement and corroborating
+README, release or source evidence. An empty search or absent asset alone is not
+enough. Findings distinguish project distribution, dependency and feature gaps
+from existing-support bugs, emulation and unknown support. The final report keeps
+at most one eligible candidate per source track; all assessments remain visible.
+
+`targets\discovery\distribution-channels.json` still supplies reviewed official
+registry evidence without guessing package names. NumPy's `win_arm64` wheels
+exclude a claim that NumPy lacks a native project distribution. But a native
+**parent** installer does not prove that every native dependency or required
+feature works. A merged workaround that disables a feature or relies on x64
+emulation is not a native fix. Open/merged genuine native fixes exclude duplicate
+recommendations; incomplete PR search evidence stays a human follow-up.
+
+Select **`reviewFocus: hermes-get-windows`** to additionally examine the reported
+Hermes desktop dependency case. The tracked `targets\discovery\review-focus.json`
+adds Hermes staging/package text and the upstream `sindresorhus/get-windows`
+README, package, issues, PRs and latest release. Hermes staging documents missing
+Windows Arm64 prebuilds and a disabled window-enumeration path; that is not proof
+that native source compilation is impossible, or that a patch has been validated.
+The focused result is retained in `focusFindings`, even if upstream work remains
+uncertain. If Hermes is absent from Trending/Foundational, it is explicitly an
+additional reference check, not an invented rank in the 100-repository pool.
+The default `reviewFocus: none` does not add a reference repository.
+
+Copilot receives only the prepared public evidence over UTF-8 standard input
+(without `-p`, which would ignore stdin). No tools, custom instructions, MCP
+servers, shell, browsing, target code execution or agent fan-out are exposed.
+Prompt and usage hashes make the actual invocation auditable. JSON validation
+checks provenance, not the truth of every AI inference: all findings remain
+provisional and require native reproduction before a repair is selected.
 
 Optionally add **`OPENARM_GITHUB_DISCOVERY_TOKEN`** under **Settings > Secrets and
 variables > Actions > New repository secret**, using a token issued for
@@ -162,7 +197,7 @@ Each response is bounded to **16 MiB and 30 seconds**; no new registry read star
 after 180 seconds in the distribution phase. A registry 404 is unverified, not
 proof of missing support; other HTTP/transport/malformed-response failures stop
 the scan visibly. No registry package is downloaded, installed or executed.
-After issue, release and distribution reads complete, **at most five authenticated
+For the **local metadata-only selector**, after issue, release and distribution reads complete, **at most five authenticated
 GraphQL query POSTs**, each with at most **100 issues**,
 checks `closedByPullRequestsReferences` for every issue passing the missing-support
 and distribution gates (at most **500 issues total**), with up to ten linked PRs
@@ -174,6 +209,18 @@ No GraphQL mutation is used; no eligible issues means no GraphQL request.
 No recommendation is emitted until every batch succeeds; a later failure retains
 partial evidence but invalidates the entire recommendation set.
 A latest-release 404 records `no_published_release`, not absent support.
+The Action instead delegates PR interpretation to the content review. Preparation
+adds at most **150 read-only GitHub requests**: one README per selected repository,
+PR searches grouped into queries of at most ten repositories, and bounded files,
+metadata, issues and releases for the optional focus and its one named dependency.
+PR searches inspect five matching bodies and include authoritative OPEN/CLOSED/
+MERGED state. README responses must be UTF-8 text within 1 MiB; the CLI receives
+up to 6,000 README characters and about 2,000 characters per issue/PR, with
+architecture-focused excerpts and truncation recorded. Focus source files are
+bounded to 64 Ki characters each. Release summaries include bounded asset names,
+not downloaded executable source. A prompt contains at most 400,000 data
+characters and a response at most 100,000. Issue/PR comments and arbitrary linked
+pages are not crawled; incomplete evidence must remain explicit.
 The Trending source adds **at most nine anonymous HTML GETs**, each limited to **2 MiB and 30 seconds**
 with no redirects, cookies or credentials. Changed/malformed markup, missing weekly
 counts or source failures stop the scan visibly; it never falls back to a
@@ -183,9 +230,10 @@ The global weekly page is language-unrestricted; supplemental pages use the fixe
 languages above, so the pool is not language-neutral. GitHub metadata and search are not a consistent
 global snapshot; documentation repositories and inapplicable issue matches may remain.
 
-Issue assessments are `reported_missing_native_support`, `existing_support_bug`, `needs_review` or
+Collection-only issue assessments are `reported_missing_native_support`, `existing_support_bug`, `needs_review` or
 `no_matching_open_issue` (plus `not_assessed`/`error` on interrupted scans).
-Matching totals and the five-title limit are explicit. **A recommendation is
+Matching totals and the five-issue limit are explicit. These title labels do not
+filter the Action's Copilot input. **A recommendation is
 provisional, not proof that the repository lacks Arm64 support.** The issue may
 still be stale, and native source builds may exist beyond the reviewed distribution
 scope. Missing matches or documentation prove nothing; aliases,
@@ -197,9 +245,11 @@ on native Windows Arm64 before choosing build commands or writing a port.
 Windows Arm64 availability, `not_a_native_port_candidate` for a portable
 distribution, `unverified` for missing/incomplete channel knowledge, or
 `missing_in_reviewed_channels` when the complete reviewed inventory corroborates
-a missing distribution. Only the last status can qualify, and never without an
-explicit missing-support issue. Native advertisements are conservative exclusions,
-not architecture or execution certification.
+a missing distribution. The local metadata-only selector requires the last
+status plus an explicit missing-support issue. The Action also reviews documented
+dependency/feature gaps that this channel-only gate cannot establish. Native
+advertisements are conservative project-distribution evidence, not certification
+of every dependency, feature or runtime.
 
 PyPI inspection considers at most **500 files in the current release**, excluding
 yanked/empty files. A `win_arm64.whl` excludes the project; a `none-any.whl` is
@@ -210,7 +260,7 @@ package (at most **100 optional dependencies**). Only explicit Windows package
 CPU restrictions can corroborate absence: missing optional dependencies or
 generic JavaScript metadata alone remain unverified.
 
-Each issue's `upstreamFixReview` records linked PR URLs, repositories, states and
+In local metadata-only mode, each issue's `upstreamFixReview` records linked PR URLs, repositories, states and
 truncation and whether evidence came from a `closing_link`, `body_reference` or
 both. **An open or merged linked closing PR excludes that issue**, including
 a fix in another owning repository. An open or merged body-reference match also
@@ -262,7 +312,8 @@ and an on-disk x64 machine field may belong to a hybrid ARM64X runtime DLL.
 Neither header alone proves that the measured application uses emulation.
 
 Each recommendation preserves its own source order and uses
-`workKind: investigate_missing_native_support`. Existing-support bugs and unknown
+`workKind: investigate_missing_native_support` or, in the Copilot report,
+`investigate_missing_native_dependency_or_feature`. Existing-support bugs and unknown
 distributions are never substituted when no missing-support candidate qualifies.
 For a reviewed GitHub distribution channel, absence requires valid, completely
 inspected, explicitly x86/x64-labelled Windows artifacts; an uninspected installer,
@@ -280,7 +331,8 @@ or generates an unreviewed native target configuration. A blank URL with
 reviewed task in the [Copilot repair workflow](#run-copilot-diagnosis-and-reviewed-repairs).
 The URL-based documentation-only trial below is not an Arm64 implementation.
 
-Local read-only equivalent: `.\scripts\Find-Arm64Candidate.ps1`.
+Local metadata-only collection: `.\scripts\Find-Arm64Candidate.ps1`.
+It does not invoke AI; the complete content review runs inside the Action.
 Use `-Track trending` or `-Track foundational` to select one source locally.
 Use `-MaxRepositories 20` for a smaller scan (accepted range **1-100**; default **100**).
 Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are needed;
@@ -519,7 +571,11 @@ This trial is **not a native porting patch or agent-benchmark result**.
 `tests\Test-GitHubTrial.ps1` exercises this flow with offline REST doubles and
 synthetic credentials; `tests\Test-RepositoryDiscovery.ps1` covers read-only
 discovery, ranking, evidence limits, partial failures and token separation.
-Repository CI never uses real GitHub tokens or performs live discovery.
+`tests\Test-DiscoveryReview.ps1` covers all-100 content review, the Hermes dependency
+case, exact citations, workflow binding and partial AI/network failures with offline
+doubles. `tests\Test-CopilotRepair.ps1` also checks UTF-8 stdin beyond the Windows
+command-line limit and a child that never reads it.
+Repository CI never uses real GitHub tokens, performs live discovery or calls paid AI.
 REST references: [forks](https://docs.github.com/en/rest/repos/forks),
 [contents](https://docs.github.com/en/rest/repos/contents),
 [pull requests](https://docs.github.com/en/rest/pulls/pulls), and
@@ -529,7 +585,7 @@ REST references: [forks](https://docs.github.com/en/rest/repos/forks),
 
 With **`createHumanHelpIssue: true`** (the default), the Actions workflow creates
 an issue in **the repository hosting OpenArm**, currently
-`https://github.com/sykuang/OpenArm`, when the trial job fails or discovery finishes
+`https://github.com/sykuang/OpenArm`, when the trial or Copilot review fails, or review finishes
 and a person must review/select a target. A successful manual access check or
 fork/PR trial does not need an issue. Canceled/skipped runs do not create one.
 This notification never posts an issue to a discovered target or its upstream.

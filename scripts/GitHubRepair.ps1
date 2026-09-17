@@ -112,10 +112,15 @@ function Invoke-RepairValidation([string] $InputPath, [string] $Output) {
     }
 }
 
-function Invoke-RepairCopilot([string] $Prompt, [string] $WorkingDirectory, [string] $Log, [string[]] $EditableFiles = @()) {
+function Invoke-RepairCopilot([string] $Prompt, [string] $WorkingDirectory, [string] $Log, [string[]] $EditableFiles = @(),
+    [switch] $PromptOnStdin, [int] $TimeoutSeconds = 600, [string] $UsageFile = '') {
     if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) { throw 'Copilot requires the Actions GITHUB_TOKEN and copilot-requests: write.' }
-    $arguments = @('-p', $Prompt, '-s', '--no-ask-user', '--no-custom-instructions', '--disable-builtin-mcps',
+    $arguments = @('-s', '--no-ask-user', '--no-custom-instructions', '--disable-builtin-mcps',
         '--disallow-temp-dir', '--deny-tool=shell', '--deny-tool=url', '--secret-env-vars=GITHUB_TOKEN')
+    $inputArguments = @{}
+    if ($PromptOnStdin) { $inputArguments.StandardInput = $Prompt }
+    else { $arguments = @('-p', $Prompt) + $arguments }
+    if ($UsageFile) { $arguments += @('--usage-output-file', $UsageFile) }
     if ($EditableFiles.Count) {
         $arguments += '--available-tools=view,edit,create,glob,grep,rg,apply_patch'
         foreach ($path in $EditableFiles) {
@@ -125,6 +130,6 @@ function Invoke-RepairCopilot([string] $Prompt, [string] $WorkingDirectory, [str
         # An explicit empty availability list hides all tools; "*" is not a permission kind.
         $arguments += '--available-tools'
     }
-    $code = Invoke-LoggedProcess copilot $arguments $WorkingDirectory $Log 600 -Agent -ActionsCopilot
+    $code = Invoke-LoggedProcess copilot $arguments $WorkingDirectory $Log $TimeoutSeconds -Agent -ActionsCopilot @inputArguments
     if ($code -ne 0) { throw "Copilot request failed (exit $code); see $Log. No automatic request retry." }
 }

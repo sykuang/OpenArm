@@ -3,6 +3,7 @@ param(
     [switch] $CreatePullRequest = ($env:OPENARM_GITHUB_TRIAL_CREATE -eq 'true'),
     [string] $Track = $(if ($env:OPENARM_DISCOVERY_TRACK) { $env:OPENARM_DISCOVERY_TRACK } else { 'both' }),
     [int] $MaxRepositories = 100,
+    [switch] $EvidenceOnly,
     [string] $Output = (Join-Path $PSScriptRoot "..\out\discovery-$([guid]::NewGuid())"),
     [string] $OutputRoot = ''
 )
@@ -22,6 +23,7 @@ $report = @{
     completedAt = $null; apiHost = 'api.github.com'; authMode = $(if ($token) { 'token' } else { 'anonymous' })
     track = $Track; requestedCount = 0; maxRepositories = $MaxRepositories; selectionShortfall = $null
     selectionMode = 'missing_native_support_only'; distributionCatalogSha256 = $null
+    reviewStatus = $(if ($EvidenceOnly) { 'awaiting_copilot_review' } else { 'metadata_only' })
     distributionAssessedCount = 0
     assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendations = @(); error = $null
     sources = @()
@@ -82,6 +84,7 @@ function Save-Discovery {
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
     $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. Budget: $($report.maxRepositories) distinct repositories total. Selected: $($report.requestedCount). Source shortfall: $($report.selectionShortfall). No lifetime-star threshold.")
     $lines.Add("Selection: **missing native support only**. Distribution channels assessed: $($report.distributionAssessedCount)/$($report.requestedCount). Existing-support bugs and unverified support are excluded.")
+    $lines.Add("Review stage: $($report.reviewStatus). In the Action, use the subsequent Copilot review artifact for content-based recommendations and dependency gaps.")
     $lines.Add("Upstream fix review: $($report.upstreamFixReview.status); issues assessed: $($report.upstreamFixReview.assessedCount)/$($report.upstreamFixReview.requestedCount).")
     foreach ($source in $report.sources) {
         $lines.Add("- $($source.track): $($source.method); status $($source.status); source $(ConvertTo-MarkdownText $source.location).")
@@ -520,9 +523,12 @@ try {
             $seenIssues[[string]$issue.number] = $true
             $title = $issue.title
             if ($token) { $title = $title.Replace($token, '[redacted]') }
+            $body = if ($issue.PSObject.Properties['body']) { [string]$issue.body } else { '' }
+            if ($token) { $body = $body.Replace($token, '[redacted]') }
             $classification = Get-IssueClassification $title
             $repository.issues += @{
                 number = $issue.number; title = $title
+                bodyEvidence = Get-RepositoryExcerpt $body
                 url = "https://github.com/$($repository.fullName)/issues/$($issue.number)"
                 classification = $classification
                 upstreamFixReview = @{
@@ -546,14 +552,19 @@ try {
         $release = Invoke-DiscoveryApi "https://api.github.com/repos/$($repository.fullName)/releases/latest" `
             @{ endpoint = 'latest_release'; repository = $repository.fullName; httpStatus = $null } -AllowNotFound
         $null = Get-ReleaseEvidence $release $repository.fullName $budget -Result $repository.release
+        $notes = if ($release -and $release.PSObject.Properties['body']) { [string]$release.body } else { '' }
+        if ($token) { $notes = $notes.Replace($token, '[redacted]') }
+        $repository.release.notesEvidence = Get-RepositoryExcerpt $notes
         $report.releaseAssessedCount++
         Save-Discovery
     }
     $currentRepository = $null
     Get-DistributionEvidence $distributionCatalog
-    Get-UpstreamFixEvidence
+    if ($EvidenceOnly) { $report.upstreamFixReview.status = 'delegated_to_copilot_review' }
+    else { Get-UpstreamFixEvidence }
     Save-Discovery
     foreach ($source in $report.sources) {
+        if ($EvidenceOnly) { continue }
         $sourceTrack = $source.track
         $candidate = $report.repositories | Where-Object {
             $_.nativeSupport.status -eq 'missing_in_reviewed_channels' -and $_.tracks -contains $sourceTrack -and

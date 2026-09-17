@@ -156,10 +156,12 @@ class PipelineChecks(unittest.TestCase):
         trial = load(ROOT / ".github" / "workflows" / "github-trial.yml")
         self.assertEqual(set(trial["on"]), {"workflow_dispatch"})
         parameters = trial["on"]["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(parameters), {"sourceRepositoryUrl", "discoveryTrack", "forkOwner", "createForkPullRequest", "createHumanHelpIssue"})
+        self.assertEqual(set(parameters), {"sourceRepositoryUrl", "discoveryTrack", "reviewFocus", "forkOwner", "createForkPullRequest", "createHumanHelpIssue"})
         self.assertEqual(parameters["discoveryTrack"]["type"], "choice")
         self.assertEqual(parameters["discoveryTrack"]["default"], "both")
         self.assertEqual(parameters["discoveryTrack"]["options"], ["both", "trending", "foundational"])
+        self.assertEqual(parameters["reviewFocus"]["default"], "none")
+        self.assertEqual(parameters["reviewFocus"]["options"], ["none", "hermes-get-windows"])
         self.assertEqual(parameters["sourceRepositoryUrl"]["default"], "")
         self.assertEqual(parameters["forkOwner"]["default"], "")
         self.assertIs(parameters["createForkPullRequest"]["default"], False)
@@ -169,7 +171,7 @@ class PipelineChecks(unittest.TestCase):
             self.assertIs(parameters[name]["required"], False)
         self.assertEqual(trial["permissions"], {"contents": "read"})
         self.assertNotIn("env", trial)
-        self.assertEqual(set(trial["jobs"]), {"trial", "human-help"})
+        self.assertEqual(set(trial["jobs"]), {"trial", "review", "human-help"})
         job = trial["jobs"]["trial"]
         self.assertEqual(job["runs-on"], "windows-11-arm")
         self.assertLessEqual(job["timeout-minutes"], 20)
@@ -177,7 +179,7 @@ class PipelineChecks(unittest.TestCase):
         self.assertNotIn("env", job)
         self.assertNotIn("permissions", job)
         steps = job["steps"]
-        self.assertEqual(len(steps), 7)
+        self.assertEqual(len(steps), 9)
         self.assertRegex(steps[0]["uses"], r"^actions/checkout@[0-9a-f]{40}$")
         self.assertEqual(steps[0]["with"], {"persist-credentials": False})
         discover, manual = steps[4:6]
@@ -189,8 +191,9 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(manual["if"], "${{ inputs.sourceRepositoryUrl != '' }}")
         for step, script in ((discover, "Find-Arm64Candidate.ps1"), (manual, "Invoke-GitHubTrial.ps1")):
             self.assertTrue((ROOT / "scripts" / script).is_file())
+            mode = " -EvidenceOnly" if step is discover else ""
             self.assertEqual(step["run"].strip(),
-                             f'.\\scripts\\{script} -Output "$env:RUNNER_TEMP\\github-trial" -OutputRoot "$env:RUNNER_TEMP"')
+                             f'.\\scripts\\{script}{mode} -Output "$env:RUNNER_TEMP\\github-trial" -OutputRoot "$env:RUNNER_TEMP"')
             self.assertNotIn("${{", step["run"])
             self.assertNotIn("continue-on-error", step)
         self.assertEqual(discover["env"], {
@@ -205,7 +208,7 @@ class PipelineChecks(unittest.TestCase):
             "OPENARM_GITHUB_TRIAL_CREATE": "${{ inputs.createForkPullRequest }}",
             "OPENARM_GITHUB_TRIAL_ID": "${{ github.repository_id }}-${{ github.run_id }}",
         })
-        upload = steps[-1]
+        upload = steps[7]
         self.assertRegex(upload["uses"], r"^actions/upload-artifact@[0-9a-f]{40}$")
         self.assertEqual(upload["if"], "${{ always() }}")
         self.assertEqual(upload["with"], {
@@ -217,6 +220,41 @@ class PipelineChecks(unittest.TestCase):
         channels = json.loads((ROOT / "targets" / "discovery" / "distribution-channels.json").read_text())
         numpy = next(item for item in channels["repositories"] if item["fullName"] == "numpy/numpy")
         self.assertIn({"provider": "pypi", "package": "numpy"}, numpy["channels"])
+
+    def test_discovery_copilot_reviews_all_sources_in_an_isolated_job(self):
+        workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")
+        prepare = workflow["jobs"]["trial"]["steps"][6]
+        self.assertIn("Invoke-DiscoveryReview.ps1 -Phase Prepare", prepare["run"])
+        self.assertEqual(prepare["if"], "${{ inputs.sourceRepositoryUrl == '' }}")
+        self.assertEqual(prepare["env"], {
+            "OPENARM_GITHUB_DISCOVERY_TOKEN": "${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}",
+            "OPENARM_DISCOVERY_FOCUS": "${{ inputs.reviewFocus }}",
+        })
+        job = workflow["jobs"]["review"]
+        self.assertEqual(job["needs"], "trial")
+        self.assertEqual(job["if"], "${{ inputs.sourceRepositoryUrl == '' }}")
+        self.assertEqual(job["permissions"], {"contents": "read", "copilot-requests": "write"})
+        self.assertEqual(job["runs-on"], "windows-11-arm")
+        self.assertLessEqual(job["timeout-minutes"], 40)
+        self.assertNotIn("env", job)
+        steps = job["steps"]
+        self.assertEqual(len(steps), 7)
+        self.assertIn("OSArchitecture", steps[2]["run"])
+        self.assertIn("ProcessArchitecture", steps[2]["run"])
+        self.assertEqual(steps[3]["with"], {"node-version": "24", "architecture": "arm64"})
+        self.assertIn("Get-PeMachine $copilotExe", steps[4]["run"])
+        self.assertIn("Invoke-DiscoveryReview.ps1 -Phase Agent", steps[5]["run"])
+        self.assertEqual(steps[5]["env"], {"GITHUB_TOKEN": "${{ github.token }}"})
+        self.assertEqual(steps[-1]["if"], "${{ always() }}")
+        self.assertIn("discovery-copilot-review", steps[-1]["with"]["name"])
+        for step in steps:
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotIn("secrets.", str(step))
+            self.assertNotIn("${{", step.get("run", ""))
+        focus = json.loads((ROOT / "targets" / "discovery" / "review-focus.json").read_text())
+        self.assertEqual(focus["repository"], "NousResearch/hermes-agent")
+        self.assertEqual(focus["dependency"]["repository"], "sindresorhus/get-windows")
+        self.assertIn("apps/desktop/scripts/stage-native-deps.mjs", focus["files"])
 
     def test_trial_installs_native_copilot_without_invoking_ai(self):
         workflow = load(ROOT / ".github" / "workflows" / "github-trial.yml")
@@ -269,8 +307,8 @@ class PipelineChecks(unittest.TestCase):
         trial = workflow["jobs"]["trial"]
         self.assertNotIn("continue-on-error", trial)
         job = workflow["jobs"]["human-help"]
-        self.assertEqual(job["needs"], "trial")
-        self.assertEqual(job["if"], "${{ always() && !cancelled() && inputs.createHumanHelpIssue && (needs.trial.result == 'failure' || (needs.trial.result == 'success' && inputs.sourceRepositoryUrl == '')) }}")
+        self.assertEqual(job["needs"], ["trial", "review"])
+        self.assertEqual(job["if"], "${{ always() && !cancelled() && inputs.createHumanHelpIssue && (needs.trial.result == 'failure' || needs.review.result == 'failure' || (needs.review.result == 'success' && inputs.sourceRepositoryUrl == '')) }}")
         self.assertEqual(job["permissions"], {"issues": "write"})
         self.assertEqual(job["runs-on"], "windows-latest")
         self.assertLessEqual(job["timeout-minutes"], 5)
@@ -287,7 +325,7 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(step["with"]["retries"], 0)
         self.assertEqual(step["env"], {
             "OPENARM_RUN_ID": "${{ github.run_id }}",
-            "OPENARM_TRIAL_RESULT": "${{ needs.trial.result }}",
+            "OPENARM_TRIAL_RESULT": "${{ (needs.trial.result == 'failure' || needs.review.result == 'failure') && 'failure' || needs.trial.result }}",
             "OPENARM_DISCOVERY": "${{ inputs.sourceRepositoryUrl == '' }}",
         })
         self.assertNotIn("${{", step["with"]["script"])

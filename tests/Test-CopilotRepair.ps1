@@ -118,6 +118,13 @@ try {
         Assert ($code -eq 0 -and (Get-Content "$root\process.log" -Raw).Trim() -ceq $case.expected) 'Only the selected agent credential reaches a subprocess; publisher token never does'
     }
     Assert-Throws { Invoke-LoggedProcess $pwsh @() $root "$root\invalid.log" -ActionsCopilot } '*only available to agent*'
+    $longPrompt = ('evidence ' * 12000) + [char]0x263A
+    $stdinProbe = '[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); $text = [Console]::In.ReadToEnd(); if ($text.Length -ne 108001 -or [int]$text[-1] -ne 0x263A) { exit 9 }; Write-Output "stdin-ok"'
+    $code = Invoke-LoggedProcess $pwsh @('-NoProfile', '-Command', $stdinProbe) $root "$root\stdin.log" 20 -StandardInput $longPrompt
+    Assert ($code -eq 0 -and (Get-Content "$root\stdin.log" -Raw).Trim() -eq 'stdin-ok') 'Large Unicode prompts reach stdin with EOF, without the Windows command-line length limit'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $code = Invoke-LoggedProcess $pwsh @('-NoProfile', '-Command', '[Threading.Thread]::Sleep(10000)') $root "$root\stdin-timeout.log" 1 -StandardInput ('x' * 3MB)
+    Assert ($code -eq 124 -and $clock.Elapsed.TotalSeconds -lt 6) 'A subprocess that never reads stdin is killed within the same bounded deadline'
     Assert ((Read-RepairTask hermes-browser-77488).mode -eq 'diagnose') 'Hermes external package issue cannot trigger edits'
     Assert ((Read-RepairTask cmake-smoke).repository -eq 'self') 'Native self-test is not an invented external repair'
     $wrapperTask = Read-RepairTask agent-browser-empty-launcher
@@ -221,13 +228,14 @@ try {
     }
 
     function Invoke-LoggedProcess {
-        param($File, $Arguments, $WorkingDirectory, $Log, $TimeoutSeconds, [switch] $Agent, [switch] $ActionsCopilot)
-        Assert ($File -eq 'copilot' -and $Agent -and $ActionsCopilot -and $TimeoutSeconds -eq 600) 'Copilot command uses explicit agent authentication and fixed timeout'
+        param($File, $Arguments, $WorkingDirectory, $Log, $TimeoutSeconds, [switch] $Agent, [switch] $ActionsCopilot, $StandardInput)
+        Assert ($File -eq 'copilot' -and $Agent -and $ActionsCopilot -and $TimeoutSeconds -in @(180, 600)) 'Copilot command uses explicit agent authentication and a bounded timeout'
         Assert ($Arguments -contains '--no-custom-instructions' -and $Arguments -contains '--disable-builtin-mcps' -and
             $Arguments -contains '--disallow-temp-dir' -and $Arguments -contains '--deny-tool=shell') 'Copilot uses bounded noninteractive permissions'
         Assert (@($Arguments | Where-Object { $_ -match 'yolo|allow-all|autopilot' }).Count -eq 0 -and
             $Arguments -notcontains '--deny-tool=*') 'No unbounded permission, invalid wildcard, or retry mode'
         $script:lastArguments = $Arguments
+        $script:lastInput = $StandardInput
         return 0
     }
     Invoke-RepairCopilot 'diagnose' $root "$root\mock-agent.log"
@@ -235,6 +243,10 @@ try {
     Invoke-RepairCopilot 'repair' $root "$root\mock-agent.log" -EditableFiles @('main.cpp')
     Assert ($lastArguments -contains '--available-tools=view,edit,create,glob,grep,rg,apply_patch' -and
         $lastArguments -contains "--allow-tool=write($root\main.cpp)" -and $lastArguments -notcontains '--allow-tool=write') 'Editing exposes only file tools and grants writes only to absolute allowlisted files'
+    Invoke-RepairCopilot $longPrompt $root "$root\mock-review.log" -PromptOnStdin -TimeoutSeconds 180 -UsageFile "$root\usage.json"
+    Assert ($lastInput -ceq $longPrompt -and $lastArguments -notcontains '-p' -and
+        $lastArguments -notcontains $longPrompt -and $lastArguments -contains '--usage-output-file' -and
+        $lastArguments[-1] -eq '--available-tools') 'Review sends evidence through stdin without a conflicting -p argument and exposes no tools'
     $env:GITHUB_TOKEN = ''
     Assert-Throws { Invoke-RepairCopilot 'missing auth' $root "$root\missing.log" } '*GITHUB_TOKEN*'
     Write-Host "Passed $checks Copilot repair checks."

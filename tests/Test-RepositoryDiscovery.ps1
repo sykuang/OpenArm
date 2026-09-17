@@ -21,7 +21,7 @@ function Assert([bool] $Condition, [string] $Message) {
     $script:checks++
 }
 function New-Issue([int] $RepoNumber, [string] $Title, [int] $Number = 1) {
-    @{ number = $Number; title = $Title; state = 'open'; body = 'Do not persist raw issue bodies.'
+    @{ number = $Number; title = $Title; state = 'open'; body = 'Public issue body for bounded content review.'
         html_url = "https://github.com/owner/repo$RepoNumber/issues/$Number"
         repository_url = "https://api.github.com/repos/owner/repo$RepoNumber" }
 }
@@ -257,6 +257,17 @@ try {
     Assert ($markdown -like '*owner/repo20*' -and $markdown -like '*Add Windows ARM64 support*' -and $markdown -like '*provisional*') 'Readable report includes the full ranking and evidence'
     Assert ($r.startedAt -and $r.completedAt -and $r.sources[0].snapshotSha256 -match '^[a-f0-9]{64}$' -and
         $r.sources[1].catalogSha256 -match '^[a-f0-9]{64}$' -and $r.limitations.Count -gt 0) 'Source provenance, timestamps and limitations are durable'
+
+    Reset-Mock
+    $global:DiscoveryMock.issues.repo2[0].body = 'Windows ARM64 dependency evidence public-test-placeholder ' + ('padding ' * 1000)
+    $global:DiscoveryMock.releases.repo2.body = 'Release notes describe published package platforms.'
+    $run = Run-Discovery 'evidence-only' @{ EvidenceOnly = $true }
+    Assert (-not $run.error -and $run.report.requestedCount -eq 20 -and $run.report.reviewStatus -eq 'awaiting_copilot_review' -and
+        $run.report.recommendations.Count -eq 0 -and $global:DiscoveryMock.graphQueries.Count -eq 0) 'Action collection delegates content judgments rather than publishing heuristic candidates'
+    Assert ($run.report.repositories[1].issues[0].bodyEvidence.text.Contains('dependency evidence [redacted]') -and
+        $run.report.repositories[1].issues[0].bodyEvidence.truncated -and
+        $run.report.repositories[1].issues[0].bodyEvidence.text.Length -le 2000 -and
+        $run.report.repositories[1].release.notesEvidence.text -eq 'Release notes describe published package platforms.') 'Already-fetched issue bodies and release notes retain bounded, redacted evidence without duplicate API reads'
 
     Reset-Mock
     $global:DiscoveryMock.repositories[0].stargazers_count = 0
@@ -745,7 +756,7 @@ try {
     Assert ($run.error -like '*inside OutputRoot*' -and $global:DiscoveryMock.calls.Count -eq 0) 'Output must remain in the caller output root'
 
     $artifacts = Get-ChildItem -LiteralPath $root -Recurse -File | Get-Content -Raw
-    Assert (@($artifacts | Where-Object { $_ -match 'public-test-placeholder|enterprise-test-placeholder|Do not persist raw issue bodies' }).Count -eq 0) 'Artifacts exclude tokens, raw API bodies and raw transport errors'
+    Assert (@($artifacts | Where-Object { $_ -match 'public-test-placeholder|enterprise-test-placeholder' }).Count -eq 0) 'Artifacts exclude tokens and raw transport errors while retaining bounded public source evidence'
     Write-Host "$checks repository discovery checks passed."
 } finally {
     Remove-Item Alias:\Receive-GitHubTrending -ErrorAction SilentlyContinue

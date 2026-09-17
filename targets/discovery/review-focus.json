@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "hermes-get-windows",
+  "repository": "NousResearch/hermes-agent",
+  "searchTerms": "\"get-windows\" \"Windows ARM64\"",
+  "files": [
+    "apps/desktop/scripts/stage-native-deps.mjs",
+    "apps/desktop/package.json"
+  ],
+  "dependency": {
+    "repository": "sindresorhus/get-windows",
+    "searchTerms": "Windows ARM64",
+    "files": ["package.json"]
+  },
+  "question": "Does Hermes preserve native Windows Arm64 window enumeration, or merely let the desktop run with get-windows absent? Distinguish native support, missing prebuilt distribution, source-build uncertainty, disabled features, existing PRs and emulation. The upstream dependency is get-windows, not get-window. This is a separately requested reference case, not an invented Trending rank."
+}

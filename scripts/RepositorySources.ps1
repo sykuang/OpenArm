@@ -87,3 +87,26 @@ function Read-FoundationalRepositories {
     }
     @{ items = $items; catalogSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
 }
+
+function Get-RepositoryExcerpt([string] $Text, [int] $Limit = 2000) {
+    $excerpt = $Text
+    if ($Text.Length -gt $Limit) {
+        $head = [int][Math]::Floor($Limit / 3)
+        $excerpt = $Text.Substring(0, $head)
+        $end = $head
+        foreach ($match in [regex]::Matches($Text, '(?i)\b(?:windows|win32|win_arm64|win-arm64|aarch64|arm64)\b')) {
+            if ($match.Index -lt $end) { continue }
+            $start = [Math]::Max($end, $match.Index - 250)
+            $remaining = $Limit - $excerpt.Length - 32
+            if ($remaining -le 0) { break }
+            $length = [Math]::Min([Math]::Min(1000, $remaining), $Text.Length - $start)
+            $excerpt += "`n[... excerpt omitted ...]`n" + $Text.Substring($start, $length)
+            $end = $start + $length
+        }
+        if ($excerpt.Length -eq $head) { $excerpt = $Text.Substring(0, $Limit) }
+    }
+    @{
+        text = $excerpt; originalCharacters = $Text.Length; truncated = ($Text.Length -gt $Limit)
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+    }
+}

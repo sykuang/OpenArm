@@ -88,7 +88,8 @@ function Assert-Target($Config) {
 function Invoke-LoggedProcess {
     param(
         [string] $File, [string[]] $Arguments = @(), [string] $WorkingDirectory,
-        [string] $Log, [int] $TimeoutSeconds = 900, [switch] $Agent, [switch] $ActionsCopilot
+        [string] $Log, [int] $TimeoutSeconds = 900, [switch] $Agent, [switch] $ActionsCopilot,
+        [string] $StandardInput
     )
     if ($ActionsCopilot -and -not $Agent) { throw 'Actions Copilot authentication is only available to agent processes.' }
     $command = Get-Command $File -CommandType Application -ErrorAction Stop | Select-Object -First 1
@@ -99,6 +100,8 @@ function Invoke-LoggedProcess {
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.RedirectStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
+    if ($start.RedirectStandardInput) { $start.StandardInputEncoding = [Text.UTF8Encoding]::new($false) }
     foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
     foreach ($key in @($start.Environment.Keys)) {
         if ($key -match '(?i)(TOKEN|SECRET|PASSWORD|ACCESSTOKEN|BRIDGE_URL)' -and
@@ -109,11 +112,23 @@ function Invoke-LoggedProcess {
     }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $started = $false
     try {
         $null = $process.Start()
+        $started = $true
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
-        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+        $timedOut = $false
+        if ($start.RedirectStandardInput) {
+            $process.StandardInput.AutoFlush = $true
+            $write = $process.StandardInput.WriteAsync($StandardInput)
+            $timedOut = -not $write.Wait([Math]::Max(0, [int]($TimeoutSeconds * 1000 - $clock.ElapsedMilliseconds)))
+            if (-not $timedOut) { $process.StandardInput.Close() }
+        }
+        if (-not $timedOut) {
+            $timedOut = -not $process.WaitForExit([Math]::Max(0, [int]($TimeoutSeconds * 1000 - $clock.ElapsedMilliseconds)))
+        }
         if ($timedOut) { $process.Kill($true); $process.WaitForExit() }
         $text = $stdout.GetAwaiter().GetResult() + "`n" + $stderr.GetAwaiter().GetResult()
         # Build output is an artifact, never interpreted as Azure logging commands.
@@ -121,6 +136,7 @@ function Invoke-LoggedProcess {
         if ($timedOut) { Add-Content -LiteralPath $Log -Value "`nOpenArm: timed out."; return 124 }
         return $process.ExitCode
     } finally {
+        if ($started -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
         $process.Dispose()
     }
 }

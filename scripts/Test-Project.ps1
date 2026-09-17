@@ -64,6 +64,7 @@ try {
     Invoke-Check 'output-paths' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-OutputPaths.ps1'))
     Invoke-Check 'github-trial' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-GitHubTrial.ps1'))
     Invoke-Check 'repository-discovery' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-RepositoryDiscovery.ps1'))
+    Invoke-Check 'copilot-discovery-review' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-DiscoveryReview.ps1'))
     Invoke-Check 'release-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-ReleaseEvidence.ps1'))
     Invoke-Check 'distribution-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-DistributionEvidence.ps1'))
     Invoke-Check 'copilot-repair' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-CopilotRepair.ps1'))

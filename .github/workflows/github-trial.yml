@@ -16,6 +16,13 @@ name: GitHub discovery and fork trial
           - trending
           - foundational
         default: both
+      reviewFocus:
+        description: Additional named dependency check, separate from the ranked 100-repository pool
+        type: choice
+        options:
+          - none
+          - hermes-get-windows
+        default: none
       forkOwner:
         description: Destination organization (blank uses the token owner)
         type: string
@@ -81,7 +88,7 @@ jobs:
           Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
       - name: Discover missing native Windows Arm64 support across up to 100 repositories
         if: ${{ inputs.sourceRepositoryUrl == '' }}
-        run: .\scripts\Find-Arm64Candidate.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
+        run: .\scripts\Find-Arm64Candidate.ps1 -EvidenceOnly -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
         env:
           OPENARM_GITHUB_DISCOVERY_TOKEN: ${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}
           OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
@@ -95,6 +102,12 @@ jobs:
           OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
           OPENARM_GITHUB_TRIAL_ID: ${{ github.repository_id }}-${{ github.run_id }}
           OPENARM_GITHUB_TOKEN: ${{ secrets.OPENARM_GITHUB_TOKEN }}
+      - name: Prepare README, issue bodies, PR bodies and states, releases and named dependency evidence
+        if: ${{ inputs.sourceRepositoryUrl == '' }}
+        run: .\scripts\Invoke-DiscoveryReview.ps1 -Phase Prepare -InputPath "$env:RUNNER_TEMP\github-trial" -Output "$env:RUNNER_TEMP\review-context" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_GITHUB_DISCOVERY_TOKEN: ${{ secrets.OPENARM_GITHUB_DISCOVERY_TOKEN || github.token }}
+          OPENARM_DISCOVERY_FOCUS: ${{ inputs.reviewFocus }}
       - name: Upload trial evidence, including failures
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -103,10 +116,76 @@ jobs:
           path: ${{ runner.temp }}\github-trial
           if-no-files-found: error
           retention-days: 7
+      - name: Preserve prepared review text including incomplete evidence
+        if: ${{ always() && inputs.sourceRepositoryUrl == '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: discovery-review-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\review-context
+          if-no-files-found: error
+          retention-days: 7
+
+  review:
+    needs: trial
+    if: ${{ inputs.sourceRepositoryUrl == '' }}
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      copilot-requests: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: discovery-review-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\review-context
+      - name: Verify native Windows Arm64 review host
+        run: |
+          if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne 'Arm64' -or
+              [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -ne 'Arm64') {
+            throw 'The Copilot review requires native Windows Arm64.'
+          }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          architecture: arm64
+      - name: Install and verify native Copilot CLI for evidence analysis
+        run: |
+          node --eval "if (process.platform !== 'win32' || process.arch !== 'arm64') throw new Error('Native Windows Arm64 Node.js is required')"
+          if ($LASTEXITCODE -ne 0) { throw 'Node.js architecture check failed.' }
+          npm install --global @github/copilot@1.0.85 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI installation failed.' }
+          $npmRoot = npm root --global
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the global npm installation.' }
+          $copilotExe = node --eval "process.stdout.write(require.resolve('@github/copilot-win32-arm64', { paths: [process.argv[1]] }))" "$npmRoot\@github\copilot"
+          if ($LASTEXITCODE -ne 0) { throw 'The native Windows Arm64 Copilot package is missing.' }
+          . .\scripts\Common.ps1
+          if ((Get-PeMachine $copilotExe) -ne 0xAA64) { throw 'Copilot CLI is not a native Arm64 executable.' }
+          & $copilotExe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
+          Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
+          Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
+      - name: Run bounded Copilot content review of every repository and the named focus
+        run: .\scripts\Invoke-DiscoveryReview.ps1 -Phase Agent -InputPath "$env:RUNNER_TEMP\review-context" -Output "$env:RUNNER_TEMP\copilot-review" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Preserve Copilot findings, exact prompts, logs and usage receipts including failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: discovery-copilot-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\copilot-review
+          if-no-files-found: error
+          retention-days: 7
 
   human-help:
-    needs: trial
-    if: ${{ always() && !cancelled() && inputs.createHumanHelpIssue && (needs.trial.result == 'failure' || (needs.trial.result == 'success' && inputs.sourceRepositoryUrl == '')) }}
+    needs: [trial, review]
+    if: ${{ always() && !cancelled() && inputs.createHumanHelpIssue && (needs.trial.result == 'failure' || needs.review.result == 'failure' || (needs.review.result == 'success' && inputs.sourceRepositoryUrl == '')) }}
     runs-on: windows-latest
     timeout-minutes: 5
     permissions:
@@ -119,7 +198,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           OPENARM_RUN_ID: ${{ github.run_id }}
-          OPENARM_TRIAL_RESULT: ${{ needs.trial.result }}
+          OPENARM_TRIAL_RESULT: ${{ (needs.trial.result == 'failure' || needs.review.result == 'failure') && 'failure' || needs.trial.result }}
           OPENARM_DISCOVERY: ${{ inputs.sourceRepositoryUrl == '' }}
         with:
           github-token: ${{ github.token }}
@@ -169,13 +248,13 @@ jobs:
               }
             }
             const reason = failed
-              ? 'The trial or evidence publication failed. A human must inspect the run logs and resolve the blocker.'
-              : 'Missing-support-only discovery completed. A human must review the separate Trending and Foundational candidates, their official distribution channels, dependency ownership, and existing fixes before selecting a native porting target. Existing native distributions and ordinary bug reports are excluded. If a track has no candidate, review the recorded limits and unverified channels rather than inventing a port.';
+              ? 'The trial, Copilot review or evidence publication failed. A human must inspect the run logs and resolve the blocker.'
+              : 'Copilot missing-support review completed. A human must review the cited README, issue/PR bodies, releases, dependency ownership and existing native fixes before selecting a porting candidate. A native parent installer or a disabled-feature workaround does not establish native dependency support. Ordinary bugs, emulation and unknown support are not new-port recommendations. If no candidate qualifies, inspect missing evidence and review limits rather than inventing a port.';
             const body = [
               marker, '', '## Human help needed', '', reason, '',
               `Workflow run and all rerun attempts: ${runUrl}`, '',
-              'Download the github-trial-<run-id>-<attempt> artifact from that run when available.',
-              'Inspect discovery.md/discovery.json for candidate evidence, or result.json/failure.log for the fork trial. If no artifact was uploaded, use the job logs.',
+              'Download discovery-copilot-review-<run-id>-<attempt> for the final review and discovery-review-context-<run-id>-<attempt> for its public source evidence.',
+              'Inspect copilot-review.md/report.json for findings and prompt/log/usage receipts. The github-trial artifact contains collection evidence, or result.json/failure.log for a URL-based fork trial. If no artifact was uploaded, use the job logs.',
               '', 'This is not proof of native Windows Arm64 compatibility or failure.',
               'This issue does not authorize code execution, a fork, a PR, or a merge. Comments and closure do not automatically resume work.',
               'After reviewing the evidence or resolving access/configuration, start a new manual workflow run with the reviewed inputs.',
