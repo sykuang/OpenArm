@@ -2,6 +2,7 @@
 param(
     [switch] $CreatePullRequest = ($env:OPENARM_GITHUB_TRIAL_CREATE -eq 'true'),
     [string] $Track = $(if ($env:OPENARM_DISCOVERY_TRACK) { $env:OPENARM_DISCOVERY_TRACK } else { 'both' }),
+    [int] $MaxRepositories = 100,
     [string] $Output = (Join-Path $PSScriptRoot "..\out\discovery-$([guid]::NewGuid())"),
     [string] $OutputRoot = ''
 )
@@ -19,7 +20,7 @@ $interval = if ($token) { 3 } else { 7 }
 $report = @{
     schemaVersion = 4; status = 'discovering'; startedAt = [DateTimeOffset]::UtcNow.ToString('o')
     completedAt = $null; apiHost = 'api.github.com'; authMode = $(if ($token) { 'token' } else { 'anonymous' })
-    track = $Track; requestedCount = 0; maxRepositoriesPerTrack = 10
+    track = $Track; requestedCount = 0; maxRepositories = $MaxRepositories; selectionShortfall = $null
     selectionMode = 'missing_native_support_only'; distributionCatalogSha256 = $null
     distributionAssessedCount = 0
     assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendations = @(); error = $null
@@ -28,6 +29,7 @@ $report = @{
         status = 'not_assessed'; requestedCount = 0; assessedCount = 0
         relationship = 'closing_links_and_issue_number_references'
         maxPullRequestsPerIssue = 10; maxReferencingPullRequestsPerIssue = 5
+        maxIssuesPerQuery = 100; maxQueries = 5
     }
     releaseScope = @{
         endpoint = 'releases/latest'; maxAssetsRecordedPerRepository = 100; maxDownloadsPerRepository = 3
@@ -37,9 +39,10 @@ $report = @{
     }
     repositories = @(); requests = @()
     limitations = @(
-        'Trending uses the first ten entries on the public GitHub weekly Trending page, preserving its displayed order, not lifetime-star order or a computed growth score.'
+        'The default budget is 100 distinct repositories total. Both tracks reserve up to half the budget for available Foundational entries, then fill with Trending; overlap does not consume another slot and remaining Foundational entries backfill a Trending shortfall.'
+        'Trending pools weekly pages in this fixed order: global, C, C++, Rust, Go, Python, JavaScript, TypeScript, C#. Pages are fetched only until the unique budget is filled (at most nine pages); first encounter preserves page/display order. This is not an official global top-100 ranking, lifetime-star order or a computed growth score.'
         'Weekly-star counts are observations reported by GitHub, not independently reconstructed star histories. Markup/source failures stop the scan; lifetime stars are never substituted.'
-        'Foundational uses a reviewed catalog of at most ten runtimes, toolchains and shared libraries. Catalog order and rationale are curated priorities, not measured dependency counts or proof of missing native support.'
+        'Foundational uses a reviewed catalog of at most 100 runtimes, toolchains and shared libraries (currently ten). Catalog order and rationale are curated priorities, not measured dependency counts or proof of missing native support. Source exhaustion is reported as selectionShortfall, never filled with an unrelated ranking.'
         'Tracks are ranked independently. Repositories appearing in both are assessed once and retain both source ranks; two recommendation slots can identify the same underlying repair candidate.'
         'There is no minimum lifetime-star threshold. Repository metadata, issue search and release reads are not a transactionally consistent snapshot.'
         'Each repository search uses open issues containing Windows AND ARM64 in title/body, newest updated first, at most five.'
@@ -50,7 +53,7 @@ $report = @{
         'Registry platform tags and GitHub asset names are advertised availability, not native execution proof. Existing native advertisements exclude porting candidates even if their binaries need separate bug investigation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
-        'One authenticated read-only GraphQL query checks up to ten linked closing PRs and five repository PRs referencing the issue number in their body for each title-eligible issue (at most 100 issues). Open or merged work is skipped; closed unmerged PRs alone do not disqualify an issue.'
+        'At most five authenticated read-only GraphQL queries, each at most 100 issues, check up to ten linked closing PRs and five repository PRs referencing each eligible issue number in their body (at most 500 issues total). Open or merged work is skipped; closed unmerged PRs alone do not disqualify an issue. No recommendation is emitted until every batch succeeds.'
         'PR body references are review leads, not proof that the PR fixes the issue. Existing open/merged referenced work prevents automatic duplicate repair; PRs without closing links or matching body references can still be missed.'
         'Missing authentication or a truncated linked-PR connection without a known active fix leaves an issue unverified and ineligible. GraphQL errors stop the scan; unlinked fixes still require human review.'
         'Before editing, review existing fixes and trace a reported application blocker to its owning dependency. A shared dependency should be repaired once, not patched separately in every caller.'
@@ -77,11 +80,16 @@ function Save-Discovery {
     $lines.Add('')
     $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/$($report.requestedCount). Releases assessed: $($report.releaseAssessedCount)/$($report.requestedCount). Authentication: $($report.authMode).")
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
-    $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. At most ten repositories per track; no lifetime-star threshold.")
+    $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. Budget: $($report.maxRepositories) distinct repositories total. Selected: $($report.requestedCount). Source shortfall: $($report.selectionShortfall). No lifetime-star threshold.")
     $lines.Add("Selection: **missing native support only**. Distribution channels assessed: $($report.distributionAssessedCount)/$($report.requestedCount). Existing-support bugs and unverified support are excluded.")
     $lines.Add("Upstream fix review: $($report.upstreamFixReview.status); issues assessed: $($report.upstreamFixReview.assessedCount)/$($report.upstreamFixReview.requestedCount).")
     foreach ($source in $report.sources) {
         $lines.Add("- $($source.track): $($source.method); status $($source.status); source $(ConvertTo-MarkdownText $source.location).")
+        if ($source.track -eq 'trending') {
+            foreach ($page in $source.pages) {
+                $lines.Add("  Weekly page: $(ConvertTo-MarkdownText $page.uri); status $($page.status); returned $($page.availableCount); first-seen repositories $($page.uniqueAddedCount).")
+            }
+        }
     }
     if ($report.error) { $lines.Add("Error: $(ConvertTo-MarkdownText $report.error)") }
     $lines.Add('')
@@ -233,102 +241,106 @@ function Get-UpstreamFixEvidence {
     $review = $report.upstreamFixReview
     $review.requestedCount = $targets.Count
     if (-not $targets.Count) { $review.status = 'no_eligible_issues'; return }
-    if ($targets.Count -gt 100) { throw 'Upstream fix review exceeded the issue bound.' }
+    if ($targets.Count -gt 500) { throw 'Upstream fix review exceeded the issue bound.' }
     if (-not $token) {
         $review.status = 'unverified_no_auth'
         foreach ($target in $targets) { $target.issue.upstreamFixReview.status = 'unverified_no_auth' }
         return
     }
     $review.status = 'assessing'
-    $fields = [Collections.Generic.List[string]]::new()
-    for ($i = 0; $i -lt $targets.Count; $i++) {
-        $target = $targets[$i]
-        if ($target.repository -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') {
-            throw 'Invalid repository identity in upstream fix review.'
-        }
-        $owner, $name = $target.repository.Split('/')
-        $fields.Add("c${i}: repository(owner: `"$owner`", name: `"$name`") { issue(number: $($target.issue.number)) { number url closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { number url state merged repository { nameWithOwner } } pageInfo { hasNextPage } } } }")
-        $target.issue.upstreamFixReview.referenceQuery = "repo:$($target.repository) is:pr $($target.issue.number) in:body sort:updated-desc"
-        $fields.Add("s${i}: search(query: `"$($target.issue.upstreamFixReview.referenceQuery)`", type: ISSUE, first: 5) { issueCount nodes { ... on PullRequest { number url state merged repository { nameWithOwner } } } pageInfo { hasNextPage } }")
-    }
-    $response = Invoke-DiscoveryApi 'https://api.github.com/graphql' `
-        @{ endpoint = 'upstream_fixes'; issueCount = $targets.Count; httpStatus = $null } `
-        -Query "query OpenArmUpstreamFixes { $($fields -join ' ') }"
-    if (($response.PSObject.Properties['errors'] -and $null -ne $response.errors -and
-            ($response.errors -isnot [array] -or $response.errors.Count)) -or
-        -not $response.PSObject.Properties['data'] -or $null -eq $response.data) {
-        throw 'GitHub upstream fix query returned errors or missing data; no candidate is verified.'
-    }
-    for ($i = 0; $i -lt $targets.Count; $i++) {
-        $target = $targets[$i]
-        $alias = "c$i"
-        if (-not $response.data.PSObject.Properties[$alias] -or $null -eq $response.data.$alias -or
-            -not $response.data.$alias.PSObject.Properties['issue'] -or $null -eq $response.data.$alias.issue) {
-            throw 'GitHub upstream fix query returned incomplete issue data.'
-        }
-        $issue = $response.data.$alias.issue
-        if (($issue.number -isnot [int] -and $issue.number -isnot [long]) -or $issue.number -ne $target.issue.number -or
-            $issue.url -cne $target.issue.url) { throw 'GitHub upstream fix query returned a mismatched issue.' }
-        $connection = $issue.closedByPullRequestsReferences
-        if ($null -eq $connection -or $connection.nodes -isnot [array] -or $connection.nodes.Count -gt 10 -or
-            $null -eq $connection.pageInfo -or $connection.pageInfo.hasNextPage -isnot [bool] -or
-            ($connection.pageInfo.hasNextPage -and $connection.nodes.Count -ne 10)) {
-            throw 'GitHub upstream fix query returned an invalid linked-PR connection.'
-        }
-        $evidence = $target.issue.upstreamFixReview
-        $searchAlias = "s$i"
-        if (-not $response.data.PSObject.Properties[$searchAlias] -or $null -eq $response.data.$searchAlias) {
-            throw 'GitHub upstream fix query returned missing PR reference search data.'
-        }
-        $search = $response.data.$searchAlias
-        if (($search.issueCount -isnot [int] -and $search.issueCount -isnot [long]) -or $search.issueCount -lt 0 -or
-            $search.nodes -isnot [array] -or $search.nodes.Count -ne [Math]::Min(5, $search.issueCount) -or
-            $null -eq $search.pageInfo -or $search.pageInfo.hasNextPage -isnot [bool] -or
-            $search.pageInfo.hasNextPage -ne ($search.issueCount -gt 5)) {
-            throw 'GitHub upstream fix query returned an invalid PR reference search.'
-        }
-        $evidence.referenceMatchCount = $search.issueCount
-        $seen = @{}
-        $references = @(
-            foreach ($node in $connection.nodes) { @{ node = $node; source = 'closing_link' } }
-            foreach ($node in $search.nodes) { @{ node = $node; source = 'body_reference' } }
-        )
-        foreach ($reference in $references) {
-            $pullRequest = $reference.node
-            if ($null -eq $pullRequest -or ($pullRequest.number -isnot [int] -and $pullRequest.number -isnot [long]) -or
-                $pullRequest.number -lt 1 -or $pullRequest.number -gt [int]::MaxValue -or
-                $pullRequest.state -cnotin @('OPEN', 'CLOSED', 'MERGED') -or $pullRequest.merged -isnot [bool] -or
-                $pullRequest.merged -ne ($pullRequest.state -ceq 'MERGED') -or $null -eq $pullRequest.repository -or
-                $pullRequest.repository.nameWithOwner -isnot [string] -or
-                $pullRequest.repository.nameWithOwner -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$' -or
-                $pullRequest.url -cne "https://github.com/$($pullRequest.repository.nameWithOwner)/pull/$($pullRequest.number)" -or
-                ($reference.source -eq 'body_reference' -and $pullRequest.repository.nameWithOwner -ine $target.repository)) {
-                throw 'GitHub upstream fix query returned an invalid or duplicate linked PR.'
+    for ($offset = 0; $offset -lt $targets.Count; $offset += 100) {
+        $batch = @($targets | Select-Object -Skip $offset -First 100)
+        $fields = [Collections.Generic.List[string]]::new()
+        for ($i = 0; $i -lt $batch.Count; $i++) {
+            $target = $batch[$i]
+            if ($target.repository -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') {
+                throw 'Invalid repository identity in upstream fix review.'
             }
-            if ($seen.ContainsKey($pullRequest.url)) {
-                $existing = $seen[$pullRequest.url]
-                if ($existing.sources -contains $reference.source -or $existing.state -cne $pullRequest.state) {
-                    throw 'GitHub upstream fix query returned duplicate or inconsistent PR evidence.'
+            $owner, $name = $target.repository.Split('/')
+            $fields.Add("c${i}: repository(owner: `"$owner`", name: `"$name`") { issue(number: $($target.issue.number)) { number url closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { number url state merged repository { nameWithOwner } } pageInfo { hasNextPage } } } }")
+            $target.issue.upstreamFixReview.referenceQuery = "repo:$($target.repository) is:pr $($target.issue.number) in:body sort:updated-desc"
+            $fields.Add("s${i}: search(query: `"$($target.issue.upstreamFixReview.referenceQuery)`", type: ISSUE, first: 5) { issueCount nodes { ... on PullRequest { number url state merged repository { nameWithOwner } } } pageInfo { hasNextPage } }")
+        }
+        $response = Invoke-DiscoveryApi 'https://api.github.com/graphql' `
+            @{ endpoint = 'upstream_fixes'; batch = [int]($offset / 100) + 1; issueCount = $batch.Count; httpStatus = $null } `
+            -Query "query OpenArmUpstreamFixes { $($fields -join ' ') }"
+        if (($response.PSObject.Properties['errors'] -and $null -ne $response.errors -and
+                ($response.errors -isnot [array] -or $response.errors.Count)) -or
+            -not $response.PSObject.Properties['data'] -or $null -eq $response.data) {
+            throw 'GitHub upstream fix query returned errors or missing data; no candidate is verified.'
+        }
+        for ($i = 0; $i -lt $batch.Count; $i++) {
+            $target = $batch[$i]
+            $alias = "c$i"
+            if (-not $response.data.PSObject.Properties[$alias] -or $null -eq $response.data.$alias -or
+                -not $response.data.$alias.PSObject.Properties['issue'] -or $null -eq $response.data.$alias.issue) {
+                throw 'GitHub upstream fix query returned incomplete issue data.'
+            }
+            $issue = $response.data.$alias.issue
+            if (($issue.number -isnot [int] -and $issue.number -isnot [long]) -or $issue.number -ne $target.issue.number -or
+                $issue.url -cne $target.issue.url) { throw 'GitHub upstream fix query returned a mismatched issue.' }
+            $connection = $issue.closedByPullRequestsReferences
+            if ($null -eq $connection -or $connection.nodes -isnot [array] -or $connection.nodes.Count -gt 10 -or
+                $null -eq $connection.pageInfo -or $connection.pageInfo.hasNextPage -isnot [bool] -or
+                ($connection.pageInfo.hasNextPage -and $connection.nodes.Count -ne 10)) {
+                throw 'GitHub upstream fix query returned an invalid linked-PR connection.'
+            }
+            $evidence = $target.issue.upstreamFixReview
+            $searchAlias = "s$i"
+            if (-not $response.data.PSObject.Properties[$searchAlias] -or $null -eq $response.data.$searchAlias) {
+                throw 'GitHub upstream fix query returned missing PR reference search data.'
+            }
+            $search = $response.data.$searchAlias
+            if (($search.issueCount -isnot [int] -and $search.issueCount -isnot [long]) -or $search.issueCount -lt 0 -or
+                $search.nodes -isnot [array] -or $search.nodes.Count -ne [Math]::Min(5, $search.issueCount) -or
+                $null -eq $search.pageInfo -or $search.pageInfo.hasNextPage -isnot [bool] -or
+                $search.pageInfo.hasNextPage -ne ($search.issueCount -gt 5)) {
+                throw 'GitHub upstream fix query returned an invalid PR reference search.'
+            }
+            $evidence.referenceMatchCount = $search.issueCount
+            $seen = @{}
+            $references = @(
+                foreach ($node in $connection.nodes) { @{ node = $node; source = 'closing_link' } }
+                foreach ($node in $search.nodes) { @{ node = $node; source = 'body_reference' } }
+            )
+            foreach ($reference in $references) {
+                $pullRequest = $reference.node
+                if ($null -eq $pullRequest -or ($pullRequest.number -isnot [int] -and $pullRequest.number -isnot [long]) -or
+                    $pullRequest.number -lt 1 -or $pullRequest.number -gt [int]::MaxValue -or
+                    $pullRequest.state -cnotin @('OPEN', 'CLOSED', 'MERGED') -or $pullRequest.merged -isnot [bool] -or
+                    $pullRequest.merged -ne ($pullRequest.state -ceq 'MERGED') -or $null -eq $pullRequest.repository -or
+                    $pullRequest.repository.nameWithOwner -isnot [string] -or
+                    $pullRequest.repository.nameWithOwner -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$' -or
+                    $pullRequest.url -cne "https://github.com/$($pullRequest.repository.nameWithOwner)/pull/$($pullRequest.number)" -or
+                    ($reference.source -eq 'body_reference' -and $pullRequest.repository.nameWithOwner -ine $target.repository)) {
+                    throw 'GitHub upstream fix query returned an invalid or duplicate linked PR.'
                 }
-                $existing.sources += $reference.source
-                continue
+                if ($seen.ContainsKey($pullRequest.url)) {
+                    $existing = $seen[$pullRequest.url]
+                    if ($existing.sources -contains $reference.source -or $existing.state -cne $pullRequest.state) {
+                        throw 'GitHub upstream fix query returned duplicate or inconsistent PR evidence.'
+                    }
+                    $existing.sources += $reference.source
+                    continue
+                }
+                $record = @{
+                    number = $pullRequest.number; url = $pullRequest.url; state = $pullRequest.state
+                    merged = $pullRequest.merged; repository = $pullRequest.repository.nameWithOwner
+                    sources = @($reference.source)
+                }
+                $seen[$pullRequest.url] = $record
+                $evidence.pullRequests += $record
             }
-            $record = @{
-                number = $pullRequest.number; url = $pullRequest.url; state = $pullRequest.state
-                merged = $pullRequest.merged; repository = $pullRequest.repository.nameWithOwner
-                sources = @($reference.source)
-            }
-            $seen[$pullRequest.url] = $record
-            $evidence.pullRequests += $record
+            $evidence.truncated = $connection.pageInfo.hasNextPage -or $search.pageInfo.hasNextPage
+            $active = @($evidence.pullRequests | Where-Object state -cin @('OPEN', 'MERGED'))
+            $evidence.status = if (@($active | Where-Object { $_.sources -contains 'closing_link' }).Count) {
+                'existing_upstream_fix'
+            } elseif ($active.Count) {
+                'existing_upstream_work'
+            } elseif ($evidence.truncated) { 'unverified_truncated' } else { 'no_active_linked_fix' }
+            $review.assessedCount++
         }
-        $evidence.truncated = $connection.pageInfo.hasNextPage -or $search.pageInfo.hasNextPage
-        $active = @($evidence.pullRequests | Where-Object state -cin @('OPEN', 'MERGED'))
-        $evidence.status = if (@($active | Where-Object { $_.sources -contains 'closing_link' }).Count) {
-            'existing_upstream_fix'
-        } elseif ($active.Count) {
-            'existing_upstream_work'
-        } elseif ($evidence.truncated) { 'unverified_truncated' } else { 'no_active_linked_fix' }
-        $review.assessedCount++
+        Save-Discovery
     }
     $review.status = 'completed'
 }
@@ -380,45 +392,92 @@ try {
         throw 'Discovery is read-only. Leave createForkPullRequest false; review a candidate and supply sourceRepositoryUrl in a separate run before creating a fork PR.'
     }
     if ($Track -cnotin @('both', 'trending', 'foundational')) { throw 'Select both, trending or foundational discovery.' }
+    if ($MaxRepositories -lt 1 -or $MaxRepositories -gt 100) { throw 'The total repository budget must be between 1 and 100.' }
     $distributionCatalog = Read-DistributionChannels
     $report.distributionCatalogSha256 = $distributionCatalog.sha256
     Write-Host "Discovering $Track repositories using $($report.authMode) GitHub.com reads ($interval seconds between searches)."
     $seeds = [Collections.Generic.List[object]]::new()
-    $seen = @{}
+    $selected = @{}; $sources = @{}; $foundationItems = @()
+    $trendingItems = [Collections.Generic.List[object]]::new()
+    $trendingSeen = @{}
     foreach ($sourceTrack in @('trending', 'foundational')) {
         if ($Track -ne 'both' -and $Track -ne $sourceTrack) { continue }
         $source = @{ track = $sourceTrack; status = 'reading'; selectedCount = 0; observedAt = [DateTimeOffset]::UtcNow.ToString('o')
-            method = $(if ($sourceTrack -eq 'trending') { 'github_weekly_trending' } else { 'reviewed_catalog_order' })
+            method = $(if ($sourceTrack -eq 'trending') { 'github_weekly_trending_pool' } else { 'reviewed_catalog_order' })
             location = $(if ($sourceTrack -eq 'trending') { 'https://github.com/trending?since=weekly' } else { 'targets\discovery\foundational.json' }) }
+        if ($sourceTrack -eq 'trending') { $source.pages = @() }
+        $sources[$sourceTrack] = $source
         $report.sources += $source
-        Save-Discovery
-        if ($sourceTrack -eq 'trending') {
-            $request = @{ endpoint = 'weekly_trending'; uri = $source.location; httpStatus = $null }
+    }
+    Save-Discovery
+    if ($sources.ContainsKey('foundational')) {
+        $selection = Read-FoundationalRepositories
+        $foundationItems = $selection.items
+        $sources.foundational.catalogSha256 = $selection.catalogSha256
+        $sources.foundational.availableCount = $foundationItems.Count
+        $sources.foundational.status = 'completed'
+        $reserve = if ($Track -eq 'both') { [int][Math]::Floor($MaxRepositories / 2) } else { $MaxRepositories }
+        foreach ($item in ($foundationItems | Select-Object -First $reserve)) { $selected[$item.fullName] = $true }
+    }
+    if ($sources.ContainsKey('trending')) {
+        $source = $sources.trending
+        $source.availableCount = 0
+        foreach ($language in @('', 'c', 'c++', 'rust', 'go', 'python', 'javascript', 'typescript', 'c#')) {
+            if ($selected.Count -ge $MaxRepositories) { break }
+            $uri = Get-GitHubTrendingUri $language
+            $page = @{ uri = $uri; language = $language; status = 'reading'
+                observedAt = [DateTimeOffset]::UtcNow.ToString('o'); availableCount = 0; uniqueAddedCount = 0; snapshotSha256 = $null }
+            $source.pages += $page
+            $request = @{ endpoint = 'weekly_trending'; uri = $uri; httpStatus = $null }
             $report.requests += $request
-            $html = Receive-GitHubTrending
+            Save-Discovery
+            $html = Receive-GitHubTrending -Language $language
             $request.httpStatus = 200
             $selection = ConvertFrom-GitHubTrending $html
-            $source.snapshotSha256 = $selection.snapshotSha256
-            $source.availableCount = $selection.availableCount
-        } else {
-            $selection = Read-FoundationalRepositories
-            $source.catalogSha256 = $selection.catalogSha256
-            $source.availableCount = $selection.items.Count
+            $page.snapshotSha256 = $selection.snapshotSha256
+            $page.availableCount = $selection.availableCount
+            if (-not $language) { $source.snapshotSha256 = $selection.snapshotSha256 }
+            foreach ($item in $selection.items) {
+                if ($trendingSeen.ContainsKey($item.fullName)) { continue }
+                $trendingSeen[$item.fullName] = $true
+                $page.uniqueAddedCount++
+                $trendingItems.Add(@{
+                    fullName = $item.fullName; rank = $trendingItems.Count + 1; weeklyStars = $item.weeklyStars
+                    evidence = @{ pageUrl = $uri; language = $language; pageRank = $item.rank }
+                })
+                if ($selected.Count -lt $MaxRepositories) { $selected[$item.fullName] = $true }
+            }
+            $source.availableCount = $trendingItems.Count
+            $page.status = 'completed'
         }
-        foreach ($item in $selection.items) {
+        $source.status = 'completed'
+    }
+    foreach ($item in $foundationItems) {
+        if ($selected.Count -ge $MaxRepositories) { break }
+        $selected[$item.fullName] = $true
+    }
+    $seen = @{}
+    foreach ($source in $report.sources) {
+        $sourceTrack = $source.track
+        $items = if ($sourceTrack -eq 'trending') { $trendingItems } else { $foundationItems }
+        foreach ($item in $items) {
+            if (-not $selected.ContainsKey($item.fullName)) { continue }
             if (-not $seen.ContainsKey($item.fullName)) {
-                $seed = @{ fullName = $item.fullName; tracks = @(); sourceRanks = @{}; weeklyStars = $null; foundationReason = $null; foundationCategory = $null }
+                $seed = @{ fullName = $item.fullName; tracks = @(); sourceRanks = @{}; weeklyStars = $null
+                    trendingEvidence = $null; foundationReason = $null; foundationCategory = $null }
                 $seen[$item.fullName] = $seed
                 $seeds.Add($seed)
             }
             $seed = $seen[$item.fullName]
             $seed.tracks += $sourceTrack; $seed.sourceRanks[$sourceTrack] = $item.rank
-            if ($sourceTrack -eq 'trending') { $seed.weeklyStars = $item.weeklyStars }
+            if ($sourceTrack -eq 'trending') { $seed.weeklyStars = $item.weeklyStars; $seed.trendingEvidence = $item.evidence }
             else { $seed.foundationReason = $item.reason; $seed.foundationCategory = $item.category }
+            $source.selectedCount++
         }
-        $source.selectedCount = $selection.items.Count; $source.status = 'completed'
+        Save-Discovery
     }
     $report.requestedCount = $seeds.Count
+    $report.selectionShortfall = $MaxRepositories - $seeds.Count
     foreach ($seed in $seeds) {
         $repository = Invoke-DiscoveryApi "https://api.github.com/repos/$($seed.fullName)" `
             @{ endpoint = 'repository'; repository = $seed.fullName; httpStatus = $null }
@@ -435,6 +494,7 @@ try {
         $report.repositories += @{
             rank = $report.repositories.Count + 1; fullName = $repository.full_name
             tracks = $seed.tracks; sourceRanks = $seed.sourceRanks; weeklyStars = $seed.weeklyStars
+            trendingEvidence = $seed.trendingEvidence
             foundationReason = $seed.foundationReason; foundationCategory = $seed.foundationCategory
             url = "https://github.com/$($repository.full_name)"; stars = $repository.stargazers_count
             language = $repository.language; defaultBranch = $repository.default_branch
@@ -521,6 +581,9 @@ try {
     }
     foreach ($source in $report.sources) {
         if ($source.status -eq 'reading') { $source.status = 'error' }
+        if ($source.track -eq 'trending') {
+            foreach ($page in $source.pages) { if ($page.status -eq 'reading') { $page.status = 'error' } }
+        }
     }
     if ($currentRepository) {
         if ($currentRepository.release.status -ne 'not_assessed') { $currentRepository.release.status = 'error' }

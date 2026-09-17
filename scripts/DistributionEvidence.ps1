@@ -1,8 +1,8 @@
 function Read-DistributionChannels {
     $path = Join-Path $PSScriptRoot '..\targets\discovery\distribution-channels.json'
     $config = Read-Json $path
-    if ($config.schemaVersion -ne 1 -or $config.repositories -isnot [array] -or $config.repositories.Count -gt 50) {
-        throw 'The reviewed distribution-channel catalog must contain at most fifty repositories.'
+    if ($config.schemaVersion -ne 1 -or $config.repositories -isnot [array] -or $config.repositories.Count -gt 100) {
+        throw 'The reviewed distribution-channel catalog must contain at most one hundred repositories.'
     }
     $repositories = @{}
     foreach ($entry in $config.repositories) {

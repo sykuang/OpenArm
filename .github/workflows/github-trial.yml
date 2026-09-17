@@ -9,7 +9,7 @@ name: GitHub discovery and fork trial
         required: false
         default: ''
       discoveryTrack:
-        description: Discovery source when the project URL is blank
+        description: Discovery source when the project URL is blank (up to 100 distinct repositories total)
         type: choice
         options:
           - both
@@ -79,7 +79,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
           Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
           Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
-      - name: Discover missing native Windows Arm64 support in both source tracks
+      - name: Discover missing native Windows Arm64 support across up to 100 repositories
         if: ${{ inputs.sourceRepositoryUrl == '' }}
         run: .\scripts\Find-Arm64Candidate.ps1 -Output "$env:RUNNER_TEMP\github-trial" -OutputRoot "$env:RUNNER_TEMP"
         env:

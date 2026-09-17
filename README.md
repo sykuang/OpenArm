@@ -77,16 +77,27 @@ Run with **`sourceRepositoryUrl` blank** and **`createForkPullRequest` unchecked
 **`createHumanHelpIssue` is checked by default**: the workflow creates an issue
 in the OpenArm repository when discovery needs review or a run fails. Uncheck it
 for a strictly read-only discovery run; the discovery script uses REST GETs and
-one GraphQL query POST, never mutations or target repository writes.
+bounded GraphQL query POSTs, never mutations or target repository writes.
 Set **`discoveryTrack`** to **`both`** (the default), `trending`, or `foundational`.
-Trending takes the first ten repositories displayed on
-[GitHub's weekly Trending page](https://github.com/trending?since=weekly), retaining
-the displayed rank and reported weekly-star count. It does not equate lifetime
-stars with recent growth or independently reconstruct star histories.
-Foundational takes up to ten entries from the reviewed
+The default scan selects **100 distinct repositories total**, not 100 per track.
+Trending starts with [GitHub's global weekly Trending page](https://github.com/trending?since=weekly),
+then supplements it only as needed with weekly pages for **C, C++, Rust, Go,
+Python, JavaScript, TypeScript and C#**, in that fixed order. Each page retains
+its displayed order; the first encounter of a repository determines its pool rank,
+page/rank provenance and reported weekly-star count. This is a **bounded weekly
+pool, not an official GitHub global top-100 ranking**. It never substitutes
+lifetime-star rankings or independently reconstructed star histories.
+Foundational uses the reviewed
 `targets\discovery\foundational.json` catalog: runtimes, toolchains and shared
-libraries, with a category and explicit rationale for each. Catalog order is a
+libraries, with a category and explicit rationale for each (currently ten entries;
+at most 100). Catalog order is a
 curated priority, not a measured dependency ranking or proof of a native gap.
+With both tracks enabled, up to half the budget is reserved for available
+Foundational entries, and Trending fills the remaining unique slots. Overlap
+does not consume a second slot. If all nine weekly pages underfill the budget,
+remaining reviewed Foundational entries can backfill it. Source exhaustion is
+reported as `selectionShortfall`, never hidden with invented repositories;
+Foundational-only currently selects ten and reports a shortfall of 90.
 There is **no minimum lifetime-star threshold**.
 
 The tracks are ranked separately and each can recommend one provisional candidate
@@ -101,7 +112,10 @@ official package-registry channels. Download the
 **`discovery.md`** contains both source rankings, rationales, issue links and binary
 evidence. **`discovery.json`** is now **schema version 4**, with
 `selectionMode: missing_native_support_only`, per-repository `nativeSupport`
-evidence and a distribution-catalog hash. `sources` retains source provenance;
+evidence and a distribution-catalog hash. `maxRepositories`, `requestedCount` and
+`selectionShortfall` distinguish the total budget from actual source coverage.
+`sources` retains per-page URL, language, timestamp, hash and count provenance;
+`trendingEvidence` preserves each repository's first page and displayed rank.
 `recommendations` remains an array with at most one entry per track. Assessments,
 request outcomes, timestamps, inspection limits and failures remain explicit.
 
@@ -129,7 +143,8 @@ permissions are needed. Without it, **GitHub Actions uses its existing read-only
 job token** for public discovery, avoiding reliance on the shared runner's
 anonymous quota. The token is passed only to GitHub API reads in the discovery step;
 Trending, registry metadata and release asset downloads remain anonymous. Local runs without this environment variable still
-use anonymous public REST reads, but cannot recommend candidates because the
+use anonymous public REST reads, but cannot complete a 100-repository scan under
+the normal shared 60-request hourly quota or recommend candidates because the
 linked-upstream-fix check requires GraphQL authentication.
 It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
 Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
@@ -137,31 +152,35 @@ Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 can still apply. HTTP errors, rate limits and incomplete responses fail visibly,
 retain partial reports and make **no recommendation**; requests are not retried.
 
-The bounded scan makes **at most 60 GitHub API GET requests**: repository metadata, one
-issue search and one latest-release read for each of at most twenty unique
+The bounded scan makes **at most 300 GitHub API GET requests**: repository metadata, one
+issue search and one latest-release read for each of at most 100 unique
 repositories. The issue query remains `repo:OWNER/REPO is:issue is:open Windows
 ARM64 in:title,body`, inspecting up to five most recently updated matches.
-Configured PyPI/npm channels add at most **40 anonymous metadata GETs** (at most
+Configured PyPI/npm channels add at most **200 anonymous metadata GETs** (at most
 one per provider per repository), without cookies, credentials or redirects.
 Each response is bounded to **16 MiB and 30 seconds**; no new registry read starts
 after 180 seconds in the distribution phase. A registry 404 is unverified, not
 proof of missing support; other HTTP/transport/malformed-response failures stop
 the scan visibly. No registry package is downloaded, installed or executed.
-After issue, release and distribution reads complete, **one authenticated GraphQL query POST**
+After issue, release and distribution reads complete, **at most five authenticated
+GraphQL query POSTs**, each with at most **100 issues**,
 checks `closedByPullRequestsReferences` for every issue passing the missing-support
-and distribution gates (at most
-100 issues), with up to ten linked PRs per issue. The same query searches each
+and distribution gates (at most **500 issues total**), with up to ten linked PRs
+per issue. Each batch also searches each
 repository for up to five PRs whose body references that issue number
 (`repo:OWNER/REPO is:pr NUMBER in:body sort:updated-desc`); both have explicit
 pagination limits.
 No GraphQL mutation is used; no eligible issues means no GraphQL request.
+No recommendation is emitted until every batch succeeds; a later failure retains
+partial evidence but invalidates the entire recommendation set.
 A latest-release 404 records `no_published_release`, not absent support.
-The Trending source adds one anonymous HTML GET, limited to **2 MiB and 30 seconds**
+The Trending source adds **at most nine anonymous HTML GETs**, each limited to **2 MiB and 30 seconds**
 with no redirects, cookies or credentials. Changed/malformed markup, missing weekly
 counts or source failures stop the scan visibly; it never falls back to a
 lifetime-star ranking. A single-track run avoids fetching the other source.
 The core API has a separate anonymous limit (normally 60 requests/hour, shared by IP).
-No language filter is applied. GitHub metadata and search are not a consistent
+The global weekly page is language-unrestricted; supplemental pages use the fixed
+languages above, so the pool is not language-neutral. GitHub metadata and search are not a consistent
 global snapshot; documentation repositories and inapplicable issue matches may remain.
 
 Issue assessments are `reported_missing_native_support`, `existing_support_bug`, `needs_review` or
@@ -263,6 +282,7 @@ The URL-based documentation-only trial below is not an Arm64 implementation.
 
 Local read-only equivalent: `.\scripts\Find-Arm64Candidate.ps1`.
 Use `-Track trending` or `-Track foundational` to select one source locally.
+Use `-MaxRepositories 20` for a smaller scan (accepted range **1-100**; default **100**).
 Set `OPENARM_GITHUB_DISCOVERY_TOKEN` only if authenticated public reads are needed;
 `-Output` selects a new report directory and optional `-OutputRoot` bounds it.
 The default output is a unique `out\discovery-*` directory.

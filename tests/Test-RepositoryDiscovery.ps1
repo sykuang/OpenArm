@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 . "$repo\scripts\Common.ps1"
+. "$repo\scripts\RepositorySources.ps1"
 $root = Join-Path $repo ".local\repository-discovery-$([guid]::NewGuid())"
 $fixture = "$root\fixture"
 $null = New-Item -ItemType Directory -Path "$fixture\scripts", "$fixture\targets\discovery"
@@ -49,7 +50,7 @@ function Reset-Mock {
     $global:DiscoveryMock = @{
         calls = [Collections.Generic.List[object]]::new()
         sleeps = [Collections.Generic.List[int]]::new()
-        repositories = @(1..20 | ForEach-Object {
+        repositories = @(1..130 | ForEach-Object {
             @{ full_name = "owner/repo$_"; stargazers_count = 300000 - $_; language = 'C++'
                 default_branch = 'main'; html_url = "https://github.com/owner/repo$_"
                 private = $false; archived = $false; fork = $false }
@@ -60,7 +61,8 @@ function Reset-Mock {
             'repo3' = @(New-Issue 3 'Missing Windows ARM64 binaries')
             'repo11' = @(New-Issue 11 'Provide native Windows ARM64 wheels')
         }
-        trendingReads = 0; trendingHtml = $null; trendingError = $false
+        trendingReads = 0; trendingHtml = $null; trendingError = $false; trendingErrorAt = 0
+        trendingPages = @{}; trendingLanguages = @()
         releases = @{
             repo2 = (New-Release @(New-ReleaseAsset 'app-win-x64.exe'))
             repo3 = (New-Release @(New-ReleaseAsset 'app-win-x64.exe' -RepoNumber 3))
@@ -75,14 +77,33 @@ function Reset-Mock {
     }
 }
 function global:Start-Sleep { param($Seconds) $global:DiscoveryMock.sleeps.Add($Seconds) }
-function global:Mock-DiscoveryTrending {
-    $m = $global:DiscoveryMock
-    $m.trendingReads++
-    if ($m.trendingError) { throw 'GitHub Trending returned HTTP 429; no retry.' }
-    if ($null -ne $m.trendingHtml) { return $m.trendingHtml }
-    (1..12 | ForEach-Object {
+function New-TrendingHtml([array] $Numbers) {
+    ($Numbers | ForEach-Object {
         "<article class=`"Box-row`"><h2><a href=`"/owner/repo$_`">Repository</a></h2><span>$(1000 + $_) stars this week</span></article>"
     }) -join "`n"
+}
+function Reset-HundredMock {
+    Reset-Mock
+    $global:DiscoveryMock.trendingPages = @{
+        '' = (New-TrendingHtml (1..25)); c = (New-TrendingHtml (21..45))
+        'c++' = (New-TrendingHtml (41..65)); rust = (New-TrendingHtml (61..85))
+        go = (New-TrendingHtml (81..105))
+    }
+    $global:DiscoveryMock.trendingPages.c = $global:DiscoveryMock.trendingPages.c.Replace('1021 stars this week', '9000 stars this week')
+    Write-Json "$fixture\targets\discovery\distribution-channels.json" @{
+        schemaVersion = 1
+        repositories = @(1..100 | ForEach-Object { @{ fullName = "owner/repo$_"; channels = @(@{ provider = 'github' }) } })
+    }
+}
+function global:Mock-DiscoveryTrending {
+    param([string] $Language = '')
+    $m = $global:DiscoveryMock
+    $m.trendingReads++
+    $m.trendingLanguages += $Language
+    if ($m.trendingError -or $m.trendingReads -eq $m.trendingErrorAt) { throw 'GitHub Trending returned HTTP 429; no retry.' }
+    if ($null -ne $m.trendingHtml) { return $m.trendingHtml }
+    if ($m.trendingPages.ContainsKey($Language)) { return $m.trendingPages[$Language] }
+    New-TrendingHtml (1..10)
 }
 Set-Alias -Name Receive-GitHubTrending -Value Mock-DiscoveryTrending -Scope Global
 function global:Mock-DiscoveryBytes {
@@ -188,9 +209,13 @@ function global:Invoke-RestMethod {
     @{ total_count = $total; incomplete_results = ($call -eq $m.incompleteAt); items = @($items) } |
         ConvertTo-Json -Depth 8 | ConvertFrom-Json
 }
-function Run-Discovery([string] $Name, [hashtable] $Arguments = @{}) {
+function Run-Discovery([string] $Name, [hashtable] $Arguments = @{}, [switch] $UseDefaultBudget) {
     $output = Join-Path $root $Name
     $errorText = ''
+    if (-not $UseDefaultBudget -and -not $Arguments.ContainsKey('MaxRepositories')) {
+        $track = if ($Arguments.ContainsKey('Track')) { $Arguments.Track } else { $env:OPENARM_DISCOVERY_TRACK }
+        $Arguments.MaxRepositories = if ($track -eq 'both') { 20 } else { 10 }
+    }
     try { & "$fixture\scripts\Find-Arm64Candidate.ps1" -Output $output -OutputRoot $root @Arguments }
     catch { $errorText = $_.Exception.Message }
     $path = Join-Path $output 'discovery.json'
@@ -198,6 +223,13 @@ function Run-Discovery([string] $Name, [hashtable] $Arguments = @{}) {
         report = $(if (Test-Path -LiteralPath $path) { Read-Json $path } else { $null }) }
 }
 try {
+    Assert ((Get-GitHubTrendingUri 'c++') -ceq 'https://github.com/trending/c%2B%2B?since=weekly' -and
+        (Get-GitHubTrendingUri 'c#') -ceq 'https://github.com/trending/c%23?since=weekly') 'Language URL encoding cannot change the fixed weekly endpoint'
+    foreach ($language in 'https://evil.invalid', '../login', 'c?since=daily') {
+        $rejected = $false
+        try { $null = Get-GitHubTrendingUri $language } catch { $rejected = $true }
+        Assert $rejected 'Unreviewed language paths are rejected before HTTP client creation'
+    }
     Reset-Mock
     $run = Run-Discovery 'ranked'
     Assert (-not $run.error) "Public discovery command succeeds: $($run.error)"
@@ -245,10 +277,12 @@ try {
     $catalog = Read-Json "$fixture\targets\discovery\foundational.json"
     $catalog.repositories[0].fullName = 'owner/repo2'
     Write-Json "$fixture\targets\discovery\foundational.json" $catalog
+    $global:DiscoveryMock.trendingHtml = New-TrendingHtml (@(1..10) + 21)
     $run = Run-Discovery 'shared-candidate'
-    Assert (-not $run.error -and $run.report.requestedCount -eq 19 -and $global:DiscoveryMock.calls.Count -eq 58 -and
+    Assert (-not $run.error -and $run.report.requestedCount -eq 20 -and $global:DiscoveryMock.calls.Count -eq 61 -and
         $run.report.repositories[1].tracks.Count -eq 2 -and $run.report.recommendations.Count -eq 2 -and
-        ($run.report.recommendations.fullName -join ',') -eq 'owner/repo2,owner/repo2') 'A shared candidate retains both ranks but is assessed only once'
+        ($run.report.recommendations.fullName -join ',') -eq 'owner/repo2,owner/repo2' -and
+        $run.report.repositories.fullName -contains 'owner/repo21') 'A shared candidate retains both ranks, is assessed once and its duplicate slot is backfilled'
     Assert ($run.report.upstreamFixReview.requestedCount -eq 2) 'Shared repositories do not duplicate linked-fix reads'
 
     foreach ($state in 'OPEN', 'MERGED', 'CLOSED') {
@@ -351,7 +385,85 @@ try {
     Assert (-not $run.error -and $run.report.upstreamFixReview.assessedCount -eq 100 -and
         $global:DiscoveryMock.graphQueries.Count -eq 1 -and $global:DiscoveryMock.calls.Count -eq 61) 'All hundred eligible issue identities are joined in one bounded query'
 
-    foreach ($case in 'empty', 'duplicate', 'bad-path', 'missing-weekly', 'oversized', 'http') {
+    foreach ($case in 'complete', 'later-batch-error') {
+        Reset-HundredMock
+        foreach ($n in 1..100) {
+            $global:DiscoveryMock.issues["repo$n"] = @(1..5 | ForEach-Object { New-Issue $n "Add Windows ARM64 support $_" $_ })
+            $global:DiscoveryMock.releases["repo$n"] = New-Release @(New-ReleaseAsset 'app-win-x64.exe' -RepoNumber $n)
+        }
+        if ($case -eq 'later-batch-error') { $global:DiscoveryMock.failAt = 302 }
+        $run = Run-Discovery "default-hundred-$case" -UseDefaultBudget
+        $r = $run.report
+        Assert ($r.maxRepositories -eq 100 -and $r.requestedCount -eq 100 -and $r.selectionShortfall -eq 0 -and
+            @($r.repositories.fullName | Sort-Object -Unique).Count -eq 100 -and
+            $r.assessedCount -eq 100 -and $r.releaseAssessedCount -eq 100 -and $r.distributionAssessedCount -eq 100) 'The unoverridden default actually assesses 100 distinct repositories on every surface'
+        Assert (($global:DiscoveryMock.trendingLanguages -join ',') -eq ',c,c++,rust,go' -and
+            $r.sources[0].pages.Count -eq 5 -and $r.sources[0].availableCount -eq 105 -and
+            $r.sources[0].selectedCount -eq 100 -and $r.sources[1].selectedCount -eq 10) 'Overlapping weekly pages backfill the unique budget without fetching unnecessary languages or losing Foundational ranks'
+        Assert ($r.repositories[25].trendingEvidence.language -eq 'c' -and
+            $r.repositories[25].trendingEvidence.pageRank -eq 6 -and
+            $r.repositories[25].sourceRanks.trending -eq 26 -and
+            $r.repositories[20].trendingEvidence.language -eq '' -and $r.repositories[20].weeklyStars -eq 1021 -and
+            $r.sources[0].pages[2].uri -eq 'https://github.com/trending/c%2B%2B?since=weekly' -and
+            @($r.sources[0].pages | Where-Object { $_.snapshotSha256 -notmatch '^[a-f0-9]{64}$' }).Count -eq 0) 'First encounter retains exact page/rank/star/hash provenance, including encoded language URLs'
+        if ($case -eq 'complete') {
+            Assert (-not $run.error -and $r.status -eq 'completed' -and $r.upstreamFixReview.assessedCount -eq 500 -and
+                $global:DiscoveryMock.graphQueries.Count -eq 5 -and $global:DiscoveryMock.calls.Count -eq 305) "Five bounded batches cover all 500 eligible issues: $($run.error)"
+            Assert (($r.requests | Where-Object endpoint -eq 'upstream_fixes').issueCount -join ',' -eq '100,100,100,100,100') 'No GraphQL batch exceeds 100 issue identities'
+            Assert ($r.recommendations.Count -eq 2 -and
+                @($r.recommendations | Where-Object { $_.workKind -ne 'investigate_missing_native_support' -or
+                    $_.distributionEvidence -ne 'missing_in_reviewed_channels' }).Count -eq 0) 'The expanded scan still recommends only evidenced missing native support'
+        } else {
+            Assert ($run.error -and $r.status -eq 'failed' -and $r.upstreamFixReview.status -eq 'error' -and
+                $r.upstreamFixReview.assessedCount -eq 100 -and $r.recommendations.Count -eq 0 -and
+                $global:DiscoveryMock.calls.Count -eq 302) 'A later batch failure preserves progress but invalidates all recommendations without retry'
+        }
+    }
+    Reset-HundredMock
+    $run = Run-Discovery 'trending-hundred' @{ Track = 'trending' } -UseDefaultBudget
+    Assert (-not $run.error -and $run.report.requestedCount -eq 100 -and $run.report.sources.Count -eq 1 -and
+        $run.report.sources[0].track -eq 'trending') 'Trending alone can fill the default 100-repository budget'
+
+    Reset-HundredMock
+    $run = Run-Discovery 'foundational-default-shortfall' @{ Track = 'foundational' } -UseDefaultBudget
+    Assert (-not $run.error -and $run.report.requestedCount -eq 10 -and $run.report.selectionShortfall -eq 90 -and
+        $global:DiscoveryMock.trendingReads -eq 0) 'The current ten-entry Foundational catalog reports a default-budget shortfall honestly'
+
+    Reset-Mock
+    $run = Run-Discovery 'weekly-exhaustion' -UseDefaultBudget
+    Assert (-not $run.error -and $run.report.requestedCount -eq 20 -and $run.report.selectionShortfall -eq 80 -and
+        $global:DiscoveryMock.trendingReads -eq 9 -and $run.report.sources[0].availableCount -eq 10 -and
+        $run.report.sources[0].pages[8].uri -eq 'https://github.com/trending/c%23?since=weekly') 'Exhausted or overlapping weekly sources stop at nine pages and never invent another ranking'
+
+    Reset-Mock
+    Write-Json "$fixture\targets\discovery\foundational.json" @{
+        schemaVersion = 1
+        repositories = @(11..110 | ForEach-Object { @{ fullName = "owner/repo$_"; category = 'library'; reason = 'Reviewed shared dependency' } })
+    }
+    $run = Run-Discovery 'foundation-backfill' @{ MaxRepositories = 25 }
+    Assert (-not $run.error -and $run.report.requestedCount -eq 25 -and $run.report.selectionShortfall -eq 0 -and
+        $run.report.sources[0].selectedCount -eq 10 -and $run.report.sources[1].selectedCount -eq 15 -and
+        $run.report.repositories[-1].fullName -eq 'owner/repo25') 'Remaining reviewed Foundational entries backfill a weekly shortfall without exceeding the total budget'
+
+    Reset-HundredMock
+    $global:DiscoveryMock.trendingErrorAt = 2
+    $run = Run-Discovery 'supplemental-page-error' -UseDefaultBudget
+    Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.recommendations.Count -eq 0 -and
+        $run.report.sources[0].pages[0].status -eq 'completed' -and $run.report.sources[0].pages[1].status -eq 'error' -and
+        $global:DiscoveryMock.trendingReads -eq 2 -and $global:DiscoveryMock.calls.Count -eq 0) 'A supplemental page failure retains provenance and fails visibly before repository requests'
+
+    foreach ($size in 0, 101) {
+        Reset-Mock
+        $run = Run-Discovery "invalid-budget-$size" @{ MaxRepositories = $size }
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $global:DiscoveryMock.calls.Count -eq 0 -and
+            $global:DiscoveryMock.trendingReads -eq 0) 'Invalid total budgets fail before network access'
+    }
+    Reset-Mock
+    $run = Run-Discovery 'one-repository' @{ MaxRepositories = 1 }
+    Assert (-not $run.error -and $run.report.requestedCount -eq 1 -and $run.report.repositories[0].fullName -eq 'owner/repo1' -and
+        $global:DiscoveryMock.trendingReads -eq 1) 'The smallest budget stays at one repository instead of rounding up both tracks'
+
+    foreach ($case in 'empty', 'duplicate', 'bad-path', 'missing-weekly', 'late-malformed', 'too-many', 'oversized', 'http') {
         Reset-Mock
         $html = Mock-DiscoveryTrending
         $global:DiscoveryMock.trendingReads = 0
@@ -360,6 +472,8 @@ try {
             'duplicate' { $html.Replace('/owner/repo2"', '/owner/repo1"') }
             'bad-path' { $html.Replace('/owner/repo1"', '/owner/../../bad"') }
             'missing-weekly' { $html.Replace('1001 stars this week', '1001 stars today') }
+            'late-malformed' { (New-TrendingHtml (1..11)).Replace('1011 stars this week', '1011 stars today') }
+            'too-many' { New-TrendingHtml (1..101) }
             'oversized' { 'x' * (2MB + 1) }
             default { $html }
         }
@@ -374,7 +488,7 @@ try {
         $catalog = Read-Json "$fixture\targets\discovery\foundational.json"
         switch ($case) {
             'empty' { $catalog.repositories = @() }
-            'too-many' { $catalog.repositories += $catalog.repositories[0] }
+            'too-many' { $catalog.repositories = @($catalog.repositories[0]) * 101 }
             'duplicate' { $catalog.repositories[1] = $catalog.repositories[0] }
             'bad-path' { $catalog.repositories[0].fullName = 'owner/../../bad' }
             'missing-reason' { $catalog.repositories[0].reason = '' }
@@ -384,11 +498,12 @@ try {
         Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.sources[1].status -eq 'error' -and
             $global:DiscoveryMock.calls.Count -eq 0) "Invalid foundational catalog $case cannot drive API access"
     }
-    foreach ($case in 'duplicate', 'bad-path', 'empty-channels', 'unreviewed-provider', 'bad-pypi', 'bad-npm') {
+    foreach ($case in 'duplicate', 'too-many', 'bad-path', 'empty-channels', 'unreviewed-provider', 'bad-pypi', 'bad-npm') {
         Reset-Mock
         $catalog = Read-Json "$fixture\targets\discovery\distribution-channels.json"
         switch ($case) {
             'duplicate' { $catalog.repositories += $catalog.repositories[0] }
+            'too-many' { $catalog.repositories = @($catalog.repositories[0]) * 101 }
             'bad-path' { $catalog.repositories[0].fullName = 'owner/../../other' }
             'empty-channels' { $catalog.repositories[0].channels = @() }
             'unreviewed-provider' { $catalog.repositories[0].channels = @(@{ provider = 'untrusted' }) }

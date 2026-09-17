@@ -182,6 +182,9 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(steps[0]["with"], {"persist-credentials": False})
         discover, manual = steps[4:6]
         self.assertIn("missing native Windows Arm64", discover["name"])
+        self.assertIn("100 repositories", discover["name"])
+        discovery_script = (ROOT / "scripts" / "Find-Arm64Candidate.ps1").read_text()
+        self.assertIn("[int] $MaxRepositories = 100", discovery_script)
         self.assertEqual(discover["if"], "${{ inputs.sourceRepositoryUrl == '' }}")
         self.assertEqual(manual["if"], "${{ inputs.sourceRepositoryUrl != '' }}")
         for step, script in ((discover, "Find-Arm64Candidate.ps1"), (manual, "Invoke-GitHubTrial.ps1")):

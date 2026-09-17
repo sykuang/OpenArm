@@ -1,7 +1,17 @@
-function Receive-GitHubTrending {
+function Get-GitHubTrendingUri([string] $Language = '') {
+    if ($Language -cnotin @('', 'c', 'c++', 'rust', 'go', 'python', 'javascript', 'typescript', 'c#')) {
+        throw 'Only the reviewed weekly Trending languages are allowed.'
+    }
+    if (-not $Language) { return 'https://github.com/trending?since=weekly' }
+    "https://github.com/trending/$([uri]::EscapeDataString($Language))?since=weekly"
+}
+
+function Receive-GitHubTrending([string] $Language = '') {
+    $uri = Get-GitHubTrendingUri $Language
     $handler = [Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
     $handler.UseCookies = $false
+    $handler.UseDefaultCredentials = $false
     $client = [Net.Http.HttpClient]::new($handler)
     $client.DefaultRequestHeaders.UserAgent.ParseAdd('OpenArm-Repository-Discovery')
     $client.DefaultRequestHeaders.AcceptLanguage.ParseAdd('en-US')
@@ -9,7 +19,7 @@ function Receive-GitHubTrending {
     $response = $null; $stream = $null
     $body = [IO.MemoryStream]::new()
     try {
-        $response = $client.GetAsync('https://github.com/trending?since=weekly',
+        $response = $client.GetAsync($uri,
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
         if ([int]$response.StatusCode -ne 200) { throw "GitHub Trending returned HTTP $([int]$response.StatusCode); no retry or alternate ranking was used." }
         if ($response.Content.Headers.ContentType.MediaType -ne 'text/html' -or
@@ -39,7 +49,7 @@ function ConvertFrom-GitHubTrending([string] $Html) {
     $articles = $pattern.Matches($Html)
     if ($articles.Count -lt 1 -or $articles.Count -gt 100) { throw 'GitHub Trending markup is missing or outside the reviewed page scope.' }
     $items = @(); $seen = @{}
-    foreach ($article in ($articles | Select-Object -First 10)) {
+    foreach ($article in $articles) {
         $link = [regex]::Match($article.Value, '(?s)<h2\b[^>]*>.*?<a\b[^>]*href="/([^"?#]+)"')
         $growth = [regex]::Match($article.Value, '(?<![\d,])(\d{1,3}(?:,\d{3})+|\d+)\s+stars this week\b')
         $name = $link.Groups[1].Value
@@ -62,8 +72,8 @@ function Read-FoundationalRepositories {
     $path = Join-Path $PSScriptRoot '..\targets\discovery\foundational.json'
     $config = Read-Json $path
     if ($config.schemaVersion -ne 1 -or $config.repositories -isnot [array] -or
-        $config.repositories.Count -lt 1 -or $config.repositories.Count -gt 10) {
-        throw 'The reviewed foundational catalog must contain one to ten repositories.'
+        $config.repositories.Count -lt 1 -or $config.repositories.Count -gt 100) {
+        throw 'The reviewed foundational catalog must contain one to one hundred repositories.'
     }
     $seen = @{}; $items = @()
     foreach ($entry in $config.repositories) {
