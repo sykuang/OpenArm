@@ -76,8 +76,8 @@ CLI are not proof of the target application's native compatibility.
 Run with **`sourceRepositoryUrl` blank** and **`createForkPullRequest` unchecked**.
 **`createHumanHelpIssue` is checked by default**: the workflow creates an issue
 in the OpenArm repository when discovery needs review or a run fails. Uncheck it
-for a strictly read-only discovery run; the discovery script itself remains
-GET-only and never writes to a target repository.
+for a strictly read-only discovery run; the discovery script uses REST GETs and
+one GraphQL query POST, never mutations or target repository writes.
 Set **`discoveryTrack`** to **`both`** (the default), `trending`, or `foundational`.
 Trending takes the first ten repositories displayed on
 [GitHub's weekly Trending page](https://github.com/trending?since=weekly), retaining
@@ -109,7 +109,8 @@ permissions are needed. Without it, **GitHub Actions uses its existing read-only
 job token** for public discovery, avoiding reliance on the shared runner's
 anonymous quota. The token is passed only to API reads in the discovery step;
 Trending and release asset downloads remain anonymous. Local runs without this environment variable still
-use anonymous public API reads.
+use anonymous public REST reads, but cannot recommend candidates because the
+linked-upstream-fix check requires GraphQL authentication.
 It never reuses `OPENARM_GITHUB_TOKEN` (which may belong to `msft.ghe.com`).
 Searches are spaced 3 seconds apart with a token or 7 seconds anonymously
 (GitHub search limits: 30 or 10 requests/minute respectively). Shared-IP limits
@@ -120,6 +121,10 @@ The bounded scan makes **at most 60 API GET requests**: repository metadata, one
 issue search and one latest-release read for each of at most twenty unique
 repositories. The issue query remains `repo:OWNER/REPO is:issue is:open Windows
 ARM64 in:title,body`, inspecting up to five most recently updated matches.
+After issue and release reads complete, **one authenticated GraphQL query POST**
+checks `closedByPullRequestsReferences` for every title-eligible issue (at most
+100 issues), with up to ten linked PRs per issue and explicit pagination limits.
+No GraphQL mutation is used; no eligible issues means no GraphQL request.
 A latest-release 404 records `no_published_release`, not absent support.
 The Trending source adds one anonymous HTML GET, limited to **2 MiB and 30 seconds**
 with no redirects, cookies or credentials. Changed/malformed markup, missing weekly
@@ -137,6 +142,18 @@ can have open bugs. Missing matches or documentation prove nothing; aliases,
 non-English reports, closed issues and older matches may be missed. A complete
 scan may honestly find no candidate. Review the linked report and reproduce it
 on native Windows Arm64 before choosing build commands or writing a port.
+
+Each issue's `upstreamFixReview` records linked PR URLs, repositories, states and
+truncation. **An open or merged linked closing PR excludes that issue**, including
+a fix in another owning repository. Closed, unmerged PRs alone do not exclude it.
+The selector continues to the next eligible issue/repository in each source order.
+Missing authentication (`unverified_no_auth`) or a truncated connection without a
+known active fix (`unverified_truncated`) cannot establish eligibility. API,
+GraphQL or malformed/partial-response errors fail the scan with no recommendations.
+`no_active_linked_fix` means only that no open/merged fix was found in the complete
+bounded connection, not that no fix exists anywhere: unlinked PRs, issue comments
+and dependency ownership still need human review. A known linked fix is skipped
+even when further links exceed the ten-PR limit.
 
 Release evidence records the tag, publication time, release URL and up to **100
 assets from the latest-release response** (names, URLs and sizes). Drafts,

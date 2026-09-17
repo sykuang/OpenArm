@@ -21,6 +21,10 @@ $report = @{
     track = $Track; requestedCount = 0; maxRepositoriesPerTrack = 10
     assessedCount = 0; releaseAssessedCount = 0; nativeVerified = $false; recommendations = @(); error = $null
     sources = @()
+    upstreamFixReview = @{
+        status = 'not_assessed'; requestedCount = 0; assessedCount = 0
+        relationship = 'closedByPullRequestsReferences'; maxPullRequestsPerIssue = 10
+    }
     releaseScope = @{
         endpoint = 'releases/latest'; maxAssetsRecordedPerRepository = 100; maxDownloadsPerRepository = 3
         maxZipBytes = 16MB; maxTotalDownloadBytes = 128MB; maxReleasePhaseSeconds = 180
@@ -38,6 +42,8 @@ $report = @{
         'Only explicit Windows Arm64 support requests or failure wording in those titles can yield a provisional recommendation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
+        'One authenticated read-only GraphQL query checks up to ten linked closing PRs for each title-eligible issue (at most 100 issues). Open or merged fixes are skipped; closed unmerged PRs alone do not disqualify an issue.'
+        'Missing authentication or a truncated linked-PR connection without a known active fix leaves an issue unverified and ineligible. GraphQL errors stop the scan; unlinked fixes still require human review.'
         'Before editing, review existing fixes and trace a reported application blocker to its owning dependency. A shared dependency should be repaired once, not patched separately in every caller.'
         'Only native Windows Arm64 support is an eligible repair goal. Emulation/fallback reports require review, not automatic remediation; native builds, 0xAA64 runtime binaries and an installed core workflow remain mandatory.'
         'Release scope is the latest published non-prerelease GitHub release and up to 100 assets returned with it, not all distribution channels or older releases.'
@@ -63,6 +69,7 @@ function Save-Discovery {
     $lines.Add("Status: **$($report.status)**. Issues assessed: $($report.assessedCount)/$($report.requestedCount). Releases assessed: $($report.releaseAssessedCount)/$($report.requestedCount). Authentication: $($report.authMode).")
     $lines.Add("Started: $($report.startedAt). Completed: $($report.completedAt).")
     $lines.Add("Selected discovery track: ``$(ConvertTo-MarkdownText $report.track)``. At most ten repositories per track; no lifetime-star threshold.")
+    $lines.Add("Upstream fix review: $($report.upstreamFixReview.status); issues assessed: $($report.upstreamFixReview.assessedCount)/$($report.upstreamFixReview.requestedCount).")
     foreach ($source in $report.sources) {
         $lines.Add("- $($source.track): $($source.method); status $($source.status); source $(ConvertTo-MarkdownText $source.location).")
     }
@@ -98,6 +105,10 @@ function Save-Discovery {
     foreach ($repository in $report.repositories) {
         foreach ($issue in $repository.issues) {
             $lines.Add("- $($repository.fullName): [$(ConvertTo-MarkdownText $issue.title)]($($issue.url)) ($($issue.classification))")
+            $lines.Add("  Upstream fix review: $($issue.upstreamFixReview.status); linked PRs truncated: $($issue.upstreamFixReview.truncated).")
+            foreach ($pullRequest in $issue.upstreamFixReview.pullRequests) {
+                $lines.Add("  Linked fix: [$($pullRequest.repository) #$($pullRequest.number)]($($pullRequest.url)) ($($pullRequest.state)).")
+            }
         }
         if ($repository.evidenceTruncated) { $lines.Add("- $($repository.fullName): additional matching issues were not inspected.") }
     }
@@ -122,16 +133,26 @@ function Save-Discovery {
     $lines | Set-Content -LiteralPath (Join-Path $Output 'discovery.md') -Encoding utf8
 }
 
-function Invoke-DiscoveryApi([string] $Uri, [hashtable] $Entry, [switch] $AllowNotFound) {
+function Invoke-DiscoveryApi([string] $Uri, [hashtable] $Entry, [switch] $AllowNotFound, [string] $Query = '') {
+    if ($Query -and ($Uri -cne 'https://api.github.com/graphql' -or
+        -not $Query.StartsWith('query OpenArmUpstreamFixes {') -or $Query -match '\bmutation\b')) {
+        throw 'Only the fixed read-only upstream fix query may use POST.'
+    }
     $report.requests += $entry
     Save-Discovery
     $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'
         'User-Agent' = 'OpenArm-Repository-Discovery' }
     if ($token) { $headers.Authorization = "Bearer $token" }
     $status = 0
+    $request = @{ Method = 'GET'; Uri = $Uri; Headers = $headers; TimeoutSec = 30
+        MaximumRedirection = 0; SkipHttpErrorCheck = $true; StatusCodeVariable = 'status'; ErrorAction = 'Stop' }
+    if ($Query) {
+        $request.Method = 'POST'
+        $request.ContentType = 'application/json'
+        $request.Body = @{ query = $Query; operationName = 'OpenArmUpstreamFixes' } | ConvertTo-Json -Compress
+    }
     try {
-        $response = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -TimeoutSec 30 `
-            -MaximumRedirection 0 -SkipHttpErrorCheck -StatusCodeVariable status -ErrorAction Stop
+        $response = Invoke-RestMethod @request
     } catch {
         # Transport exceptions can reflect request headers; keep raw exceptions out of logs and artifacts.
         throw 'GitHub discovery transport failed. No request was retried; check network connectivity and rerun.'
@@ -172,6 +193,87 @@ function Get-IssueClassification([string] $Title) {
         return 'reported_arm64_work'
     }
     'needs_review'
+}
+
+function Get-UpstreamFixEvidence {
+    $targets = @(
+        foreach ($repository in $report.repositories) {
+            foreach ($issue in $repository.issues) {
+                if ($issue.classification -eq 'reported_arm64_work') {
+                    @{ repository = $repository.fullName; issue = $issue }
+                }
+            }
+        }
+    )
+    $review = $report.upstreamFixReview
+    $review.requestedCount = $targets.Count
+    if (-not $targets.Count) { $review.status = 'no_eligible_issues'; return }
+    if ($targets.Count -gt 100) { throw 'Upstream fix review exceeded the issue bound.' }
+    if (-not $token) {
+        $review.status = 'unverified_no_auth'
+        foreach ($target in $targets) { $target.issue.upstreamFixReview.status = 'unverified_no_auth' }
+        return
+    }
+    $review.status = 'assessing'
+    $fields = [Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $targets.Count; $i++) {
+        $target = $targets[$i]
+        if ($target.repository -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') {
+            throw 'Invalid repository identity in upstream fix review.'
+        }
+        $owner, $name = $target.repository.Split('/')
+        $fields.Add("c${i}: repository(owner: `"$owner`", name: `"$name`") { issue(number: $($target.issue.number)) { number url closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { number url state merged repository { nameWithOwner } } pageInfo { hasNextPage } } } }")
+    }
+    $response = Invoke-DiscoveryApi 'https://api.github.com/graphql' `
+        @{ endpoint = 'upstream_fixes'; issueCount = $targets.Count; httpStatus = $null } `
+        -Query "query OpenArmUpstreamFixes { $($fields -join ' ') }"
+    if (($response.PSObject.Properties['errors'] -and $null -ne $response.errors -and
+            ($response.errors -isnot [array] -or $response.errors.Count)) -or
+        -not $response.PSObject.Properties['data'] -or $null -eq $response.data) {
+        throw 'GitHub upstream fix query returned errors or missing data; no candidate is verified.'
+    }
+    for ($i = 0; $i -lt $targets.Count; $i++) {
+        $target = $targets[$i]
+        $alias = "c$i"
+        if (-not $response.data.PSObject.Properties[$alias] -or $null -eq $response.data.$alias -or
+            -not $response.data.$alias.PSObject.Properties['issue'] -or $null -eq $response.data.$alias.issue) {
+            throw 'GitHub upstream fix query returned incomplete issue data.'
+        }
+        $issue = $response.data.$alias.issue
+        if (($issue.number -isnot [int] -and $issue.number -isnot [long]) -or $issue.number -ne $target.issue.number -or
+            $issue.url -cne $target.issue.url) { throw 'GitHub upstream fix query returned a mismatched issue.' }
+        $connection = $issue.closedByPullRequestsReferences
+        if ($null -eq $connection -or $connection.nodes -isnot [array] -or $connection.nodes.Count -gt 10 -or
+            $null -eq $connection.pageInfo -or $connection.pageInfo.hasNextPage -isnot [bool] -or
+            ($connection.pageInfo.hasNextPage -and $connection.nodes.Count -ne 10)) {
+            throw 'GitHub upstream fix query returned an invalid linked-PR connection.'
+        }
+        $evidence = $target.issue.upstreamFixReview
+        $seen = @{}
+        foreach ($pullRequest in $connection.nodes) {
+            if ($null -eq $pullRequest -or ($pullRequest.number -isnot [int] -and $pullRequest.number -isnot [long]) -or
+                $pullRequest.number -lt 1 -or $pullRequest.number -gt [int]::MaxValue -or
+                $pullRequest.state -cnotin @('OPEN', 'CLOSED', 'MERGED') -or $pullRequest.merged -isnot [bool] -or
+                $pullRequest.merged -ne ($pullRequest.state -ceq 'MERGED') -or $null -eq $pullRequest.repository -or
+                $pullRequest.repository.nameWithOwner -isnot [string] -or
+                $pullRequest.repository.nameWithOwner -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$' -or
+                $pullRequest.url -cne "https://github.com/$($pullRequest.repository.nameWithOwner)/pull/$($pullRequest.number)" -or
+                $seen.ContainsKey($pullRequest.url)) {
+                throw 'GitHub upstream fix query returned an invalid or duplicate linked PR.'
+            }
+            $seen[$pullRequest.url] = $true
+            $evidence.pullRequests += @{
+                number = $pullRequest.number; url = $pullRequest.url; state = $pullRequest.state
+                merged = $pullRequest.merged; repository = $pullRequest.repository.nameWithOwner
+            }
+        }
+        $evidence.truncated = $connection.pageInfo.hasNextPage
+        $evidence.status = if (@($evidence.pullRequests | Where-Object state -cin @('OPEN', 'MERGED')).Count) {
+            'existing_upstream_fix'
+        } elseif ($evidence.truncated) { 'unverified_truncated' } else { 'no_active_linked_fix' }
+        $review.assessedCount++
+    }
+    $review.status = 'completed'
 }
 
 $currentRepository = $null
@@ -250,17 +352,22 @@ try {
         foreach ($issue in $issues.items) {
             if ($issue.state -ne 'open' -or $issue.PSObject.Properties['pull_request'] -or
                 $issue.repository_url -ne "https://api.github.com/repos/$($repository.fullName)" -or
-                ($issue.number -isnot [int] -and $issue.number -isnot [long]) -or $issue.number -lt 1 -or
+                ($issue.number -isnot [int] -and $issue.number -isnot [long]) -or $issue.number -lt 1 -or $issue.number -gt [int]::MaxValue -or
                 $seenIssues.ContainsKey([string]$issue.number) -or $issue.title -isnot [string] -or -not $issue.title) {
                 throw 'GitHub returned an invalid, duplicated or out-of-scope issue.'
             }
             $seenIssues[[string]$issue.number] = $true
             $title = $issue.title
             if ($token) { $title = $title.Replace($token, '[redacted]') }
+            $classification = Get-IssueClassification $title
             $repository.issues += @{
                 number = $issue.number; title = $title
                 url = "https://github.com/$($repository.fullName)/issues/$($issue.number)"
-                classification = Get-IssueClassification $title
+                classification = $classification
+                upstreamFixReview = @{
+                    status = $(if ($classification -eq 'reported_arm64_work') { 'not_assessed' } else { 'not_applicable' })
+                    truncated = $false; pullRequests = @()
+                }
             }
         }
         $repository.assessment = if (@($repository.issues | Where-Object classification -eq 'reported_arm64_work').Count) {
@@ -280,12 +387,16 @@ try {
         Save-Discovery
     }
     $currentRepository = $null
+    Get-UpstreamFixEvidence
+    Save-Discovery
     foreach ($source in $report.sources) {
         $sourceTrack = $source.track
-        $candidate = $report.repositories | Where-Object { $_.assessment -eq 'reported_arm64_work' -and $_.tracks -contains $sourceTrack } |
+        $candidate = $report.repositories | Where-Object {
+            $_.tracks -contains $sourceTrack -and @($_.issues | Where-Object { $_.upstreamFixReview.status -eq 'no_active_linked_fix' }).Count
+        } |
             Sort-Object { $_.sourceRanks[$sourceTrack] } | Select-Object -First 1
         if (-not $candidate) { continue }
-        $issue = $candidate.issues | Where-Object classification -eq 'reported_arm64_work' | Select-Object -First 1
+        $issue = $candidate.issues | Where-Object { $_.upstreamFixReview.status -eq 'no_active_linked_fix' } | Select-Object -First 1
         $report.recommendations += @{
             track = $sourceTrack; sourceRank = $candidate.sourceRanks[$sourceTrack]; nativeGoal = 'native_windows_arm64'
             fullName = $candidate.fullName; repositoryUrl = $candidate.url; stars = $candidate.stars
@@ -300,6 +411,8 @@ try {
     }
     $report.status = 'completed'
 } catch {
+    $report.recommendations = @()
+    if ($report.upstreamFixReview.status -eq 'assessing') { $report.upstreamFixReview.status = 'error' }
     foreach ($source in $report.sources) {
         if ($source.status -eq 'reading') { $source.status = 'error' }
     }

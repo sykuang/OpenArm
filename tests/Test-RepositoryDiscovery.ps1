@@ -30,6 +30,10 @@ function New-ReleaseAsset([string] $Name, [long] $Size = 256) {
     @{ name = $Name; size = $Size; state = 'uploaded'
         browser_download_url = "https://github.com/owner/repo2/releases/download/v1/$([uri]::EscapeDataString($Name))" }
 }
+function New-LinkedPullRequest([string] $State = 'OPEN', [int] $Number = 42, [string] $Repository = 'owner/repo2') {
+    @{ number = $Number; url = "https://github.com/$Repository/pull/$Number"; state = $State
+        merged = ($State -ceq 'MERGED'); repository = @{ nameWithOwner = $Repository } }
+}
 function Reset-Mock {
     $env:OPENARM_GITHUB_DISCOVERY_TOKEN = 'public-test-placeholder'
     $env:OPENARM_DISCOVERY_TRACK = 'both'
@@ -55,6 +59,7 @@ function Reset-Mock {
         releases = @{}; downloads = 0; assetMachine = 0xAA64; assetFailure = $false
         issueTotal = @{}; incompleteAt = 0; failAt = 0; failStatus = 403
         throwAt = 0; malformedAt = 0
+        linkedPullRequests = @{}; truncatedFixes = @(); graphError = ''; graphQueries = @()
     }
 }
 function global:Start-Sleep { param($Seconds) $global:DiscoveryMock.sleeps.Add($Seconds) }
@@ -83,11 +88,12 @@ function global:Mock-DiscoveryBytes {
 }
 Set-Alias -Name Receive-ReleaseBytes -Value Mock-DiscoveryBytes -Scope Global
 function global:Invoke-RestMethod {
-    param($Method, $Uri, $Headers, $TimeoutSec, $MaximumRedirection,
+    param($Method, $Uri, $Headers, $TimeoutSec, $MaximumRedirection, $ContentType, $Body,
         [switch] $SkipHttpErrorCheck, $StatusCodeVariable, $ErrorAction)
     $m = $global:DiscoveryMock
     $url = [uri]$Uri
-    if ($Method -ne 'GET' -or $url.Host -ne 'api.github.com' -or $url.Scheme -ne 'https' -or
+    $graph = $Method -ceq 'POST' -and $url.AbsolutePath -ceq '/graphql'
+    if (($Method -cne 'GET' -and -not $graph) -or $url.Host -ne 'api.github.com' -or $url.Scheme -ne 'https' -or
         $MaximumRedirection -ne 0 -or $TimeoutSec -ne 30) { throw 'Unexpected network boundary.' }
     $authorization = if ($Headers.ContainsKey('Authorization')) { $Headers.Authorization } else { '' }
     $m.calls.Add(@{ route = [uri]::UnescapeDataString($url.PathAndQuery); authorization = $authorization })
@@ -97,6 +103,39 @@ function global:Invoke-RestMethod {
     Set-Variable -Name $StatusCodeVariable -Value $status -Scope 1
     if ($status -ne 200) { return [pscustomobject]@{ message = 'Secret public-test-placeholder' } }
     if ($call -eq $m.malformedAt) { return [pscustomobject]@{ message = 'Invalid response' } }
+    if ($graph) {
+        $payload = $Body | ConvertFrom-Json
+        if ($ContentType -cne 'application/json' -or $payload.operationName -cne 'OpenArmUpstreamFixes' -or
+            -not $payload.query.StartsWith('query OpenArmUpstreamFixes {') -or $payload.query -match '\bmutation\b') {
+            throw 'Unexpected GraphQL operation.'
+        }
+        $m.graphQueries += $payload.query
+        $data = @{}
+        $targets = [regex]::Matches($payload.query, 'c(\d+): repository\(owner: "owner", name: "(repo\d+)"\) \{ issue\(number: (\d+)\)')
+        if ($targets.Count -lt 1 -or $targets.Count -gt 100) { throw 'Unexpected GraphQL issue bound.' }
+        foreach ($target in $targets) {
+            $alias = 'c' + $target.Groups[1].Value
+            $name = $target.Groups[2].Value
+            $number = [int]$target.Groups[3].Value
+            $key = "$name/$number"
+            $nodes = @(if ($m.linkedPullRequests.ContainsKey($key)) { $m.linkedPullRequests[$key] })
+            $data[$alias] = @{ issue = @{
+                number = $number; url = "https://github.com/owner/$name/issues/$number"
+                closedByPullRequestsReferences = @{ nodes = $nodes; pageInfo = @{ hasNextPage = ($key -in $m.truncatedFixes) } }
+            } }
+        }
+        $response = @{ data = $data }
+        switch ($m.graphError) {
+            'errors' { $response.errors = @(@{ message = 'Secret public-test-placeholder' }) }
+            'partial' { $data.Remove('c1') }
+            'null-issue' { $data.c0.issue = $null }
+            'wrong-issue' { $data.c0.issue.number = 99 }
+            'wrong-url' { $data.c0.issue.url = 'https://evil.invalid/issue' }
+            'null-nodes' { $data.c0.issue.closedByPullRequestsReferences.nodes = $null }
+            'bad-page' { $data.c0.issue.closedByPullRequestsReferences.pageInfo.hasNextPage = 'false' }
+        }
+        return $response | ConvertTo-Json -Depth 15 | ConvertFrom-Json
+    }
     if ($url.AbsolutePath -match '^/repos/owner/(repo\d+)/releases/latest$') {
         if ($m.releases.ContainsKey($Matches[1])) {
             return $m.releases[$Matches[1]] | ConvertTo-Json -Depth 12 | ConvertFrom-Json
@@ -129,7 +168,10 @@ try {
     Assert (-not $run.error) "Public discovery command succeeds: $($run.error)"
     $r = $run.report
     Assert ($r.status -eq 'completed' -and $r.repositories.Count -eq 20 -and $r.assessedCount -eq 20) 'Exactly twenty repositories are assessed'
-    Assert ($global:DiscoveryMock.calls.Count -eq 60 -and $global:DiscoveryMock.trendingReads -eq 1) 'One weekly page plus twenty metadata, issue and release reads, with no repository star search'
+    Assert ($global:DiscoveryMock.calls.Count -eq 61 -and $global:DiscoveryMock.trendingReads -eq 1 -and
+        $global:DiscoveryMock.graphQueries.Count -eq 1) 'One weekly page, sixty REST reads and one batched upstream fix query, with no repository star search'
+    Assert ($r.upstreamFixReview.status -eq 'completed' -and $r.upstreamFixReview.assessedCount -eq 3 -and
+        $r.repositories[1].issues[0].upstreamFixReview.status -eq 'no_active_linked_fix') 'Only title-eligible issues receive the linked-fix review'
     Assert ($r.releaseAssessedCount -eq 20 -and $r.repositories[0].release.status -eq 'no_published_release') 'A missing stable release stays unknown, not proof of absent Arm64 support'
     Assert ($global:DiscoveryMock.calls[0].route -eq '/repos/owner/repo1' -and $r.sources.Count -eq 2) 'Repository identity comes from the two reviewed sources, not an all-time-star search'
     Assert (($r.repositories.fullName -join ',') -eq ((1..20 | ForEach-Object { "owner/repo$_" }) -join ',')) 'Displayed Trending order and curated Foundational order are preserved independently'
@@ -159,7 +201,7 @@ try {
         $env:OPENARM_DISCOVERY_TRACK = $track
         $run = Run-Discovery "track-$track"
         Assert (-not $run.error -and $run.report.requestedCount -eq 10 -and $run.report.recommendations.Count -eq 1 -and
-            $run.report.recommendations[0].track -eq $track -and $global:DiscoveryMock.calls.Count -eq 30) 'Either track can run independently using the real workflow environment input'
+            $run.report.recommendations[0].track -eq $track -and $global:DiscoveryMock.calls.Count -eq 31) 'Either track can run independently using the real workflow environment input'
         Assert ($global:DiscoveryMock.trendingReads -eq $(if ($track -eq 'trending') { 1 } else { 0 })) 'Foundational-only mode does not fetch Trending'
     }
     Reset-Mock
@@ -167,9 +209,84 @@ try {
     $catalog.repositories[0].fullName = 'owner/repo2'
     Write-Json "$fixture\targets\discovery\foundational.json" $catalog
     $run = Run-Discovery 'shared-candidate'
-    Assert (-not $run.error -and $run.report.requestedCount -eq 19 -and $global:DiscoveryMock.calls.Count -eq 57 -and
+    Assert (-not $run.error -and $run.report.requestedCount -eq 19 -and $global:DiscoveryMock.calls.Count -eq 58 -and
         $run.report.repositories[1].tracks.Count -eq 2 -and $run.report.recommendations.Count -eq 2 -and
         ($run.report.recommendations.fullName -join ',') -eq 'owner/repo2,owner/repo2') 'A shared candidate retains both ranks but is assessed only once'
+    Assert ($run.report.upstreamFixReview.requestedCount -eq 2) 'Shared repositories do not duplicate linked-fix reads'
+
+    foreach ($state in 'OPEN', 'MERGED', 'CLOSED') {
+        Reset-Mock
+        $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(New-LinkedPullRequest $state)
+        $run = Run-Discovery "linked-$state"
+        $expected = if ($state -eq 'CLOSED') { 'owner/repo2' } else { 'owner/repo3' }
+        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq $expected) "Skip open/merged fixes, not abandoned closed-unmerged work: $state ($($run.error))"
+        $evidence = $run.report.repositories[1].issues[0].upstreamFixReview
+        Assert ($evidence.pullRequests.Count -eq 1 -and $evidence.pullRequests[0].state -ceq $state -and
+            $evidence.pullRequests[0].url -eq 'https://github.com/owner/repo2/pull/42') 'Linked PR identity and state remain inspectable'
+        $markdown = Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw
+        Assert ($markdown.Contains('https://github.com/owner/repo2/pull/42') -and
+            $markdown.Contains($evidence.status)) 'Readable report explains upstream fix exclusions with links'
+    }
+    Reset-Mock
+    $global:DiscoveryMock.issues['repo2'] += New-Issue 2 'Another Windows ARM64 build fails' 2
+    $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(New-LinkedPullRequest)
+    $run = Run-Discovery 'other-issue'
+    Assert (-not $run.error -and $run.report.recommendations[0].issueUrl -eq 'https://github.com/owner/repo2/issues/2') 'An unrelated unclaimed issue in the same repository remains eligible'
+    Reset-Mock
+    $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(New-LinkedPullRequest -Repository 'dependency/native-library')
+    $run = Run-Discovery 'dependency-fix'
+    Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo3' -and
+        $run.report.repositories[1].issues[0].upstreamFixReview.pullRequests[0].repository -eq 'dependency/native-library') 'A linked fix in the owning dependency also prevents duplicate work'
+    foreach ($active in $false, $true) {
+        Reset-Mock
+        $global:DiscoveryMock.truncatedFixes = @('repo2/1')
+        $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(1..10 | ForEach-Object { New-LinkedPullRequest 'CLOSED' $_ })
+        if ($active) { $global:DiscoveryMock.linkedPullRequests['repo2/1'][0] = New-LinkedPullRequest 'OPEN' 1 }
+        $run = Run-Discovery "truncated-fixes-$active"
+        $expected = if ($active) { 'existing_upstream_fix' } else { 'unverified_truncated' }
+        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo3' -and
+            $run.report.repositories[1].issues[0].upstreamFixReview.status -eq $expected -and
+            $global:DiscoveryMock.calls.Count -eq 61) 'Truncated connections never establish absence of active fixes and do not trigger pagination'
+    }
+    Reset-Mock
+    foreach ($name in 'repo2', 'repo3', 'repo11') {
+        $global:DiscoveryMock.linkedPullRequests["$name/1"] = @(New-LinkedPullRequest -Repository "owner/$name")
+    }
+    $run = Run-Discovery 'all-fixed'
+    Assert (-not $run.error -and $run.report.recommendations.Count -eq 0) 'No recommendation is better than duplicating known upstream work'
+    foreach ($case in 'errors', 'partial', 'null-issue', 'wrong-issue', 'wrong-url', 'null-nodes', 'bad-page',
+        'http', 'transport', 'malformed', 'bad-pr-url', 'bad-pr-repo', 'bad-state', 'inconsistent-merge', 'duplicate', 'too-many', 'short-page') {
+        Reset-Mock
+        $global:DiscoveryMock.graphError = $case
+        $pullRequest = New-LinkedPullRequest
+        switch ($case) {
+            'http' { $global:DiscoveryMock.failAt = 61 }
+            'transport' { $global:DiscoveryMock.throwAt = 61 }
+            'malformed' { $global:DiscoveryMock.malformedAt = 61 }
+            'bad-pr-url' { $pullRequest.url = 'https://evil.invalid/fix' }
+            'bad-pr-repo' { $pullRequest.repository.nameWithOwner = 'owner/../../bad' }
+            'bad-state' { $pullRequest.state = 'UNKNOWN' }
+            'inconsistent-merge' { $pullRequest.merged = $true }
+            'short-page' { $global:DiscoveryMock.truncatedFixes = @('repo2/1') }
+        }
+        $global:DiscoveryMock.linkedPullRequests['repo2/1'] = switch ($case) {
+            'duplicate' { @($pullRequest, $pullRequest) }
+            'too-many' { @(1..11 | ForEach-Object { New-LinkedPullRequest 'CLOSED' $_ }) }
+            default { @($pullRequest) }
+        }
+        $run = Run-Discovery "invalid-fix-$case"
+        Assert ($run.error -and $run.report.status -eq 'failed' -and $run.report.upstreamFixReview.status -eq 'error' -and
+            $run.report.recommendations.Count -eq 0 -and $run.report.releaseAssessedCount -eq 20 -and
+            $global:DiscoveryMock.calls.Count -eq 61) "Invalid linked-fix response fails visibly without retry or premature recommendations: $case"
+    }
+    Reset-Mock
+    $global:DiscoveryMock.issues = @{}
+    foreach ($n in 1..20) {
+        $global:DiscoveryMock.issues["repo$n"] = @(1..5 | ForEach-Object { New-Issue $n "Windows ARM64 build fails $_" $_ })
+    }
+    $run = Run-Discovery 'max-linked-issues'
+    Assert (-not $run.error -and $run.report.upstreamFixReview.assessedCount -eq 100 -and
+        $global:DiscoveryMock.graphQueries.Count -eq 1 -and $global:DiscoveryMock.calls.Count -eq 61) 'All hundred eligible issue identities are joined in one bounded query'
 
     foreach ($case in 'empty', 'duplicate', 'bad-path', 'missing-weekly', 'oversized', 'http') {
         Reset-Mock
@@ -269,6 +386,7 @@ try {
     $global:DiscoveryMock.issues = @{}
     $run = Run-Discovery 'none'
     Assert (-not $run.error -and $run.report.status -eq 'completed' -and $run.report.recommendations.Count -eq 0) 'Complete scan can honestly recommend no candidate'
+    Assert ($run.report.upstreamFixReview.status -eq 'no_eligible_issues' -and $global:DiscoveryMock.calls.Count -eq 60) 'No eligible issues require no GraphQL request'
     Assert ((Get-Content -LiteralPath (Join-Path $run.output 'discovery.md') -Raw) -like '*No evidence-backed candidate*') 'No candidate is explicit in the readable report'
 
     foreach ($token in '', '$(OpenArm.GitHubDiscoveryToken)') {
@@ -276,6 +394,9 @@ try {
         $env:OPENARM_GITHUB_DISCOVERY_TOKEN = $token
         $run = Run-Discovery "anonymous-$([guid]::NewGuid())"
         Assert (-not $run.error -and $run.report.authMode -eq 'anonymous') "Missing or unexpanded optional token uses explicit anonymous mode: $($run.error)"
+        Assert ($run.report.recommendations.Count -eq 0 -and $run.report.upstreamFixReview.status -eq 'unverified_no_auth' -and
+            $run.report.repositories[1].issues[0].upstreamFixReview.status -eq 'unverified_no_auth' -and
+            $global:DiscoveryMock.calls.Count -eq 60) 'Anonymous reads retain evidence but cannot assert that upstream fixes are absent'
         Assert (@($global:DiscoveryMock.calls | Where-Object authorization -ne '').Count -eq 0) 'Anonymous mode never falls back to the enterprise token'
         Assert ($global:DiscoveryMock.sleeps.Count -eq 20 -and @($global:DiscoveryMock.sleeps | Where-Object { $_ -ne 7 }).Count -eq 0) 'Anonymous searches are paced below ten per minute'
     }
@@ -297,7 +418,7 @@ try {
     $run = Run-Discovery 'bounded-issues'
     Assert (-not $run.error -and $run.report.repositories[1].matchingIssueCount -eq 12 -and
         $run.report.repositories[1].issues.Count -eq 5 -and $run.report.repositories[1].evidenceTruncated) 'Only five recent issue titles are inspected and truncation stays visible'
-    Assert ($global:DiscoveryMock.calls.Count -eq 60 -and $run.report.recommendations[0].fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
+    Assert ($global:DiscoveryMock.calls.Count -eq 61 -and $run.report.recommendations[0].fullName -eq 'owner/repo3') 'Truncation does not widen the scan or manufacture evidence'
 
     foreach ($field in 'incompleteAt', 'malformedAt', 'throwAt') {
         $points = if ($field -eq 'incompleteAt') { @(21, 24) } else { @(1, 24) }
