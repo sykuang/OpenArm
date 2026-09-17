@@ -60,6 +60,7 @@ function Reset-Mock {
         issueTotal = @{}; incompleteAt = 0; failAt = 0; failStatus = 403
         throwAt = 0; malformedAt = 0
         linkedPullRequests = @{}; truncatedFixes = @(); graphError = ''; graphQueries = @()
+        referencingPullRequests = @{}; referenceTotals = @{}
     }
 }
 function global:Start-Sleep { param($Seconds) $global:DiscoveryMock.sleeps.Add($Seconds) }
@@ -123,6 +124,14 @@ function global:Invoke-RestMethod {
                 number = $number; url = "https://github.com/owner/$name/issues/$number"
                 closedByPullRequestsReferences = @{ nodes = $nodes; pageInfo = @{ hasNextPage = ($key -in $m.truncatedFixes) } }
             } }
+            $referenceNodes = @(if ($m.referencingPullRequests.ContainsKey($key)) { $m.referencingPullRequests[$key] })
+            $referenceTotal = if ($m.referenceTotals.ContainsKey($key)) { $m.referenceTotals[$key] } else { $referenceNodes.Count }
+            $data['s' + $target.Groups[1].Value] = @{
+                issueCount = $referenceTotal; nodes = $referenceNodes; pageInfo = @{ hasNextPage = ($referenceTotal -gt 5) }
+            }
+            if (-not $payload.query.Contains("search(query: `"repo:owner/$name is:pr $number in:body sort:updated-desc`", type: ISSUE, first: 5)")) {
+                throw 'The bounded PR reference query is missing.'
+            }
         }
         $response = @{ data = $data }
         switch ($m.graphError) {
@@ -133,6 +142,9 @@ function global:Invoke-RestMethod {
             'wrong-url' { $data.c0.issue.url = 'https://evil.invalid/issue' }
             'null-nodes' { $data.c0.issue.closedByPullRequestsReferences.nodes = $null }
             'bad-page' { $data.c0.issue.closedByPullRequestsReferences.pageInfo.hasNextPage = 'false' }
+            'missing-search' { $data.Remove('s0') }
+            'bad-search-total' { $data.s0.issueCount = -1 }
+            'short-search' { $data.s0.issueCount = 1 }
         }
         return $response | ConvertTo-Json -Depth 15 | ConvertFrom-Json
     }
@@ -254,8 +266,32 @@ try {
     }
     $run = Run-Discovery 'all-fixed'
     Assert (-not $run.error -and $run.report.recommendations.Count -eq 0) 'No recommendation is better than duplicating known upstream work'
+    foreach ($state in 'OPEN', 'MERGED', 'CLOSED') {
+        Reset-Mock
+        $global:DiscoveryMock.referencingPullRequests['repo2/1'] = @(New-LinkedPullRequest $state)
+        $run = Run-Discovery "referenced-$state"
+        $expected = if ($state -eq 'CLOSED') { 'owner/repo2' } else { 'owner/repo3' }
+        Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq $expected) "Referenced PR work is reviewed even without closing keywords: $state"
+        Assert ($run.report.repositories[1].issues[0].upstreamFixReview.pullRequests[0].sources[0] -eq 'body_reference' -and
+            $run.report.repositories[1].issues[0].upstreamFixReview.referenceMatchCount -eq 1) 'Reference-search provenance is distinct from a linked closing fix'
+    }
+    Reset-Mock
+    $global:DiscoveryMock.linkedPullRequests['repo2/1'] = @(New-LinkedPullRequest)
+    $global:DiscoveryMock.referencingPullRequests['repo2/1'] = @(New-LinkedPullRequest)
+    $run = Run-Discovery 'overlapping-pr-evidence'
+    $evidence = $run.report.repositories[1].issues[0].upstreamFixReview
+    Assert (-not $run.error -and $evidence.pullRequests.Count -eq 1 -and
+        $evidence.pullRequests[0].sources.Count -eq 2 -and $evidence.status -eq 'existing_upstream_fix') 'The same PR is joined once with both evidence sources'
+    Reset-Mock
+    $global:DiscoveryMock.referencingPullRequests['repo2/1'] = @(1..5 | ForEach-Object { New-LinkedPullRequest 'CLOSED' $_ })
+    $global:DiscoveryMock.referenceTotals['repo2/1'] = 8
+    $run = Run-Discovery 'truncated-reference-search'
+    Assert (-not $run.error -and $run.report.recommendations[0].fullName -eq 'owner/repo3' -and
+        $run.report.repositories[1].issues[0].upstreamFixReview.status -eq 'unverified_truncated' -and
+        $global:DiscoveryMock.calls.Count -eq 61) 'More than five PR references cannot prove absence of active work and do not widen the scan'
     foreach ($case in 'errors', 'partial', 'null-issue', 'wrong-issue', 'wrong-url', 'null-nodes', 'bad-page',
-        'http', 'transport', 'malformed', 'bad-pr-url', 'bad-pr-repo', 'bad-state', 'inconsistent-merge', 'duplicate', 'too-many', 'short-page') {
+        'http', 'transport', 'malformed', 'bad-pr-url', 'bad-pr-repo', 'bad-state', 'inconsistent-merge', 'duplicate', 'too-many', 'short-page',
+        'missing-search', 'bad-search-total', 'short-search', 'foreign-search-repo') {
         Reset-Mock
         $global:DiscoveryMock.graphError = $case
         $pullRequest = New-LinkedPullRequest
@@ -268,6 +304,7 @@ try {
             'bad-state' { $pullRequest.state = 'UNKNOWN' }
             'inconsistent-merge' { $pullRequest.merged = $true }
             'short-page' { $global:DiscoveryMock.truncatedFixes = @('repo2/1') }
+            'foreign-search-repo' { $global:DiscoveryMock.referencingPullRequests['repo2/1'] = @(New-LinkedPullRequest -Repository 'other/project') }
         }
         $global:DiscoveryMock.linkedPullRequests['repo2/1'] = switch ($case) {
             'duplicate' { @($pullRequest, $pullRequest) }

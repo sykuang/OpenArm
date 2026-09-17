@@ -58,6 +58,55 @@ class ReproductionChecks(unittest.TestCase):
             self.assertIsNone(result["exitCode"])
             self.assertTrue((Path(temp) / result["log"]).is_file())
 
+    def test_loaded_native_view_is_required_not_a_filename_exception(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "runtime.json"
+            for machine in ("0xAA64", "0x8664", "0xA641"):
+                modules = [{"path": "vcruntime140_1.dll", "diskMachine": "0x8664", "mappedMachine": machine}]
+                with patch.object(repro, "loaded_modules", return_value=modules):
+                    if machine == "0xAA64":
+                        repro.runtime_snapshot(path, "before_inverse", [])
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "native Arm64 PE view"):
+                            repro.runtime_snapshot(path, "before_inverse", [])
+                self.assertEqual(json.loads(path.read_text())["snapshots"][0]["modules"], modules)
+
+    def test_success_without_native_dependency_evidence_cannot_pass(self):
+        def finish(command, stdout, **_):
+            evidence = {"dtype": "complex64", "matrix": "symm", "iterations": 100, "version": "2.3.2"}
+            stdout.write("NUMPY_REPRO_OK=" + json.dumps(evidence) + "\n")
+            return repro.subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(repro.subprocess, "run", side_effect=finish):
+            output = Path(temp)
+            result = repro.run_case(output, "2.3.2", "complex64", "symm")
+            self.assertEqual(result["status"], "unverified_runtime")
+            for phases, machine, verified in (
+                (["before_inverse"], "0xAA64", False),
+                (["before_inverse", "after_inverse"], "0x8664", False),
+                (["before_inverse", "after_inverse"], "0xAA64", True),
+            ):
+                runtime = {"snapshots": [
+                    {"phase": phase, "modules": [{"mappedMachine": machine}]} for phase in phases
+                ]}
+                (output / result["runtimeLog"]).write_text(json.dumps(runtime))
+                result = repro.run_case(output, "2.3.2", "complex64", "symm")
+                self.assertEqual(result["nativeRuntimeVerified"], verified)
+                self.assertEqual(result["status"], "passed" if verified else "unverified_runtime")
+
+    def test_every_packaged_numpy_binary_still_requires_arm64(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for machine in ("0x8664", "0xA641", "0xA64E"):
+                output = Path(temp) / machine
+                inventory = [{"scope": "numpy-wheel", "machine": machine, "path": "extension.pyd"}]
+                args = ["numpy_reproduction.py", "--version", "2.3.2", "--output", str(output)]
+                with patch.object(repro, "native_inventory", return_value=inventory), patch.object(repro.sys, "argv", args):
+                    with self.assertRaisesRegex(RuntimeError, "packaged in the NumPy wheel"):
+                        repro.main()
+                report = json.loads((output / "result.json").read_text())
+                self.assertFalse(report["nativeRuntimeVerified"])
+                self.assertEqual(report["cases"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

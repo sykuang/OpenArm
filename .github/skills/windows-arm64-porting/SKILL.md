@@ -19,7 +19,13 @@ skill's repair scope and cannot qualify as native evidence or a porting PR.
 5. Use `scripts\Test-NativeWorker.ps1` to inventory worker prerequisites; it is not
    native execution evidence. Rebuild on an actual Windows Arm64 worker with an
    Arm64 validation process. Confirm every packaged EXE/DLL, including required
-   runtime dependencies, has PE machine 0xAA64. Run nonempty tests, install to a
+   runtime dependencies, has PE machine 0xAA64. For interpreted targets, keep the
+   target package inventory separate from incidental files installed with the
+   interpreter. Verify the actual interpreter and loaded dependencies during the
+   core workflow: platform ARM64X DLLs may have a different on-disk header, but
+   must expose a verified native Arm64 (0xAA64) loaded view in the native process.
+   A filename exception, ARM64EC-only view or unverified hybrid header is not
+   sufficient. Preserve both on-disk and loaded-view evidence. Run nonempty tests, install to a
    fresh prefix, and launch the installed application's declared core workflow.
    An Arm64 filename, cross-build, x64 launch, or version/help probe is insufficient.
 6. Record raw wall-time samples and binary hashes. Clearly limit claims to the

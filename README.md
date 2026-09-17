@@ -123,7 +123,10 @@ repositories. The issue query remains `repo:OWNER/REPO is:issue is:open Windows
 ARM64 in:title,body`, inspecting up to five most recently updated matches.
 After issue and release reads complete, **one authenticated GraphQL query POST**
 checks `closedByPullRequestsReferences` for every title-eligible issue (at most
-100 issues), with up to ten linked PRs per issue and explicit pagination limits.
+100 issues), with up to ten linked PRs per issue. The same query searches each
+repository for up to five PRs whose body references that issue number
+(`repo:OWNER/REPO is:pr NUMBER in:body sort:updated-desc`); both have explicit
+pagination limits.
 No GraphQL mutation is used; no eligible issues means no GraphQL request.
 A latest-release 404 records `no_published_release`, not absent support.
 The Trending source adds one anonymous HTML GET, limited to **2 MiB and 30 seconds**
@@ -144,16 +147,22 @@ scan may honestly find no candidate. Review the linked report and reproduce it
 on native Windows Arm64 before choosing build commands or writing a port.
 
 Each issue's `upstreamFixReview` records linked PR URLs, repositories, states and
-truncation. **An open or merged linked closing PR excludes that issue**, including
-a fix in another owning repository. Closed, unmerged PRs alone do not exclude it.
+truncation and whether evidence came from a `closing_link`, `body_reference` or
+both. **An open or merged linked closing PR excludes that issue**, including
+a fix in another owning repository. An open or merged body-reference match also
+excludes it as `existing_upstream_work`, even without a formal closing link.
+References are review leads, not proof that a PR resolves the issue; this
+conservative exclusion avoids duplicating existing work such as a "maybe fixes"
+dependency update. Closed, unmerged PRs alone do not exclude it.
 The selector continues to the next eligible issue/repository in each source order.
 Missing authentication (`unverified_no_auth`) or a truncated connection without a
 known active fix (`unverified_truncated`) cannot establish eligibility. API,
 GraphQL or malformed/partial-response errors fail the scan with no recommendations.
 `no_active_linked_fix` means only that no open/merged fix was found in the complete
-bounded connection, not that no fix exists anywhere: unlinked PRs, issue comments
-and dependency ownership still need human review. A known linked fix is skipped
-even when further links exceed the ten-PR limit.
+bounded closing-link and reference-search results, not that no fix exists
+anywhere: PRs without those references, issue comments and dependency ownership
+still need human review. Known open/merged work is skipped even when more links
+or search matches exceed the limits.
 
 Release evidence records the tag, publication time, release URL and up to **100
 assets from the latest-release response** (names, URLs and sizes). Drafts,
@@ -183,7 +192,9 @@ invalid PE/ZIP data and filename/header mismatches are flagged; oversized
 archives, unsupported formats (including MSI/MSIX), large PE header offsets and
 budget limits remain explicitly unverified. These are header observations, not
 signature/integrity checks, proof that every component is Arm64, or a successful
-application launch. An x86 PE header may also belong to managed AnyCPU code.
+application launch. An x86 PE header may also belong to managed AnyCPU code,
+and an on-disk x64 machine field may belong to a hybrid ARM64X runtime DLL.
+Neither header alone proves that the measured application uses emulation.
 
 Each recommendation still requires an inspected matching issue and preserves
 its own source order. Its `workKind` directs review toward an artifact problem, an
@@ -219,7 +230,16 @@ exact PyPI `cp312-cp312-win_arm64` wheel hashes. It does not edit NumPy, call an
 AI agent, create a fork/PR or consume a publishing secret.
 
 `scripts\numpy_reproduction.py` checks the native OS/process and PE headers/hashes
-of the installed Python/NumPy runtime EXE, DLL and PYD files, then exercises the
+of the installed Python/NumPy EXE, DLL and PYD files, retaining separate
+`numpy-wheel` and `python-installation` inventories. Every binary packaged in the
+NumPy wheel and the executing Python interpreter must be PE **0xAA64**. Each child
+also records the loaded dependency modules before and after its inverse cases:
+every module must expose an in-memory PE **0xAA64** view in that native process.
+Both file headers/hashes and mapped headers remain in the evidence, so genuine
+platform ARM64X runtime libraries are not mistaken for x64-only dependencies.
+There are no filename exemptions; an x64 or ARM64EC-only loaded view fails.
+Ancillary, unexecuted files installed with Python are not NumPy wheel contents
+or proof of an emulation dependency. The harness exercises the
 issue's seed, 20-by-20 matrix, complex64/complex128 and symmetric/hermitian inputs.
 Float32/float64 controls are included. Two child processes run at a time, each
 performing 100 inversions and checking the inverse residual, with a 120-second
@@ -228,7 +248,8 @@ failure, setup failure, timeout and missing completion evidence.
 
 Download both `numpy-reproduction-<version>-<run-id>-<attempt>` artifacts, including
 failed jobs. They contain the install log, runtime binary inventory, per-case logs
-and `cases\result.json`. This is **wheel reproduction, not a native source repair**.
+and `cases\result.json`, plus each case's `*-runtime.json` module snapshots.
+This is **wheel reproduction, not a native source repair**.
 A passing current wheel does not prove that older wheels or other workflows work;
 an old-only failure is not a reason to invent a new source fix. A reproduced
 current failure still needs dependency ownership and a reviewed source-build
@@ -238,9 +259,13 @@ The [native trial on September 17, 2026](https://github.com/sykuang/OpenArm/acti
 installed both pinned wheels but stopped **before running the inverse cases**:
 the Python 3.12.10 Arm64 toolcache package contains `vcruntime140_1.dll` with PE
 machine **0x8664**, while the other 65 inventoried Python/NumPy binaries are
-**0xAA64**. The strict package gate remains unchanged. This is a runtime-package
-inventory blocker, not a reproduced NumPy crash or evidence that the Python
-process used emulation. No NumPy fix or native draft PR resulted from this trial.
+**0xAA64**. Subsequent `dumpbin /headers /loadconfig` inspection identifies that
+exact DLL as **ARM64X**; [CPython #109669](https://github.com/python/cpython/issues/109669)
+also discusses this runtime. The original audit was too broad: a disk machine
+field alone does not identify a hybrid DLL's native execution view. The corrected
+audit above requires actual native dependency evidence instead of treating every
+incidental interpreter file as a NumPy dependency. The historical run is not a
+reproduced NumPy crash or evidence of emulation; it produced no native draft.
 REST reference: [search syntax, scope, incomplete results and rate limits](https://docs.github.com/en/rest/search/search).
 Release references: [latest published release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
 and [release asset downloads](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).

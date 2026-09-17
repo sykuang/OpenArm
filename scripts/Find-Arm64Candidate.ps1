@@ -23,7 +23,8 @@ $report = @{
     sources = @()
     upstreamFixReview = @{
         status = 'not_assessed'; requestedCount = 0; assessedCount = 0
-        relationship = 'closedByPullRequestsReferences'; maxPullRequestsPerIssue = 10
+        relationship = 'closing_links_and_issue_number_references'
+        maxPullRequestsPerIssue = 10; maxReferencingPullRequestsPerIssue = 5
     }
     releaseScope = @{
         endpoint = 'releases/latest'; maxAssetsRecordedPerRepository = 100; maxDownloadsPerRepository = 3
@@ -42,7 +43,8 @@ $report = @{
         'Only explicit Windows Arm64 support requests or failure wording in those titles can yield a provisional recommendation.'
         'Aliases, other languages, older matches beyond five, closed issues and undocumented support may be missed.'
         'No matching issue is not proof of support; an open issue is not proof of a reproduced failure or absent support.'
-        'One authenticated read-only GraphQL query checks up to ten linked closing PRs for each title-eligible issue (at most 100 issues). Open or merged fixes are skipped; closed unmerged PRs alone do not disqualify an issue.'
+        'One authenticated read-only GraphQL query checks up to ten linked closing PRs and five repository PRs referencing the issue number in their body for each title-eligible issue (at most 100 issues). Open or merged work is skipped; closed unmerged PRs alone do not disqualify an issue.'
+        'PR body references are review leads, not proof that the PR fixes the issue. Existing open/merged referenced work prevents automatic duplicate repair; PRs without closing links or matching body references can still be missed.'
         'Missing authentication or a truncated linked-PR connection without a known active fix leaves an issue unverified and ineligible. GraphQL errors stop the scan; unlinked fixes still require human review.'
         'Before editing, review existing fixes and trace a reported application blocker to its owning dependency. A shared dependency should be repaired once, not patched separately in every caller.'
         'Only native Windows Arm64 support is an eligible repair goal. Emulation/fallback reports require review, not automatic remediation; native builds, 0xAA64 runtime binaries and an installed core workflow remain mandatory.'
@@ -107,7 +109,7 @@ function Save-Discovery {
             $lines.Add("- $($repository.fullName): [$(ConvertTo-MarkdownText $issue.title)]($($issue.url)) ($($issue.classification))")
             $lines.Add("  Upstream fix review: $($issue.upstreamFixReview.status); linked PRs truncated: $($issue.upstreamFixReview.truncated).")
             foreach ($pullRequest in $issue.upstreamFixReview.pullRequests) {
-                $lines.Add("  Linked fix: [$($pullRequest.repository) #$($pullRequest.number)]($($pullRequest.url)) ($($pullRequest.state)).")
+                $lines.Add("  Upstream work: [$($pullRequest.repository) #$($pullRequest.number)]($($pullRequest.url)) ($($pullRequest.state)); evidence: $($pullRequest.sources -join ', ').")
             }
         }
         if ($repository.evidenceTruncated) { $lines.Add("- $($repository.fullName): additional matching issues were not inspected.") }
@@ -223,6 +225,8 @@ function Get-UpstreamFixEvidence {
         }
         $owner, $name = $target.repository.Split('/')
         $fields.Add("c${i}: repository(owner: `"$owner`", name: `"$name`") { issue(number: $($target.issue.number)) { number url closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { number url state merged repository { nameWithOwner } } pageInfo { hasNextPage } } } }")
+        $target.issue.upstreamFixReview.referenceQuery = "repo:$($target.repository) is:pr $($target.issue.number) in:body sort:updated-desc"
+        $fields.Add("s${i}: search(query: `"$($target.issue.upstreamFixReview.referenceQuery)`", type: ISSUE, first: 5) { issueCount nodes { ... on PullRequest { number url state merged repository { nameWithOwner } } } pageInfo { hasNextPage } }")
     }
     $response = Invoke-DiscoveryApi 'https://api.github.com/graphql' `
         @{ endpoint = 'upstream_fixes'; issueCount = $targets.Count; httpStatus = $null } `
@@ -249,8 +253,25 @@ function Get-UpstreamFixEvidence {
             throw 'GitHub upstream fix query returned an invalid linked-PR connection.'
         }
         $evidence = $target.issue.upstreamFixReview
+        $searchAlias = "s$i"
+        if (-not $response.data.PSObject.Properties[$searchAlias] -or $null -eq $response.data.$searchAlias) {
+            throw 'GitHub upstream fix query returned missing PR reference search data.'
+        }
+        $search = $response.data.$searchAlias
+        if (($search.issueCount -isnot [int] -and $search.issueCount -isnot [long]) -or $search.issueCount -lt 0 -or
+            $search.nodes -isnot [array] -or $search.nodes.Count -ne [Math]::Min(5, $search.issueCount) -or
+            $null -eq $search.pageInfo -or $search.pageInfo.hasNextPage -isnot [bool] -or
+            $search.pageInfo.hasNextPage -ne ($search.issueCount -gt 5)) {
+            throw 'GitHub upstream fix query returned an invalid PR reference search.'
+        }
+        $evidence.referenceMatchCount = $search.issueCount
         $seen = @{}
-        foreach ($pullRequest in $connection.nodes) {
+        $references = @(
+            foreach ($node in $connection.nodes) { @{ node = $node; source = 'closing_link' } }
+            foreach ($node in $search.nodes) { @{ node = $node; source = 'body_reference' } }
+        )
+        foreach ($reference in $references) {
+            $pullRequest = $reference.node
             if ($null -eq $pullRequest -or ($pullRequest.number -isnot [int] -and $pullRequest.number -isnot [long]) -or
                 $pullRequest.number -lt 1 -or $pullRequest.number -gt [int]::MaxValue -or
                 $pullRequest.state -cnotin @('OPEN', 'CLOSED', 'MERGED') -or $pullRequest.merged -isnot [bool] -or
@@ -258,18 +279,31 @@ function Get-UpstreamFixEvidence {
                 $pullRequest.repository.nameWithOwner -isnot [string] -or
                 $pullRequest.repository.nameWithOwner -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$' -or
                 $pullRequest.url -cne "https://github.com/$($pullRequest.repository.nameWithOwner)/pull/$($pullRequest.number)" -or
-                $seen.ContainsKey($pullRequest.url)) {
+                ($reference.source -eq 'body_reference' -and $pullRequest.repository.nameWithOwner -ine $target.repository)) {
                 throw 'GitHub upstream fix query returned an invalid or duplicate linked PR.'
             }
-            $seen[$pullRequest.url] = $true
-            $evidence.pullRequests += @{
+            if ($seen.ContainsKey($pullRequest.url)) {
+                $existing = $seen[$pullRequest.url]
+                if ($existing.sources -contains $reference.source -or $existing.state -cne $pullRequest.state) {
+                    throw 'GitHub upstream fix query returned duplicate or inconsistent PR evidence.'
+                }
+                $existing.sources += $reference.source
+                continue
+            }
+            $record = @{
                 number = $pullRequest.number; url = $pullRequest.url; state = $pullRequest.state
                 merged = $pullRequest.merged; repository = $pullRequest.repository.nameWithOwner
+                sources = @($reference.source)
             }
+            $seen[$pullRequest.url] = $record
+            $evidence.pullRequests += $record
         }
-        $evidence.truncated = $connection.pageInfo.hasNextPage
-        $evidence.status = if (@($evidence.pullRequests | Where-Object state -cin @('OPEN', 'MERGED')).Count) {
+        $evidence.truncated = $connection.pageInfo.hasNextPage -or $search.pageInfo.hasNextPage
+        $active = @($evidence.pullRequests | Where-Object state -cin @('OPEN', 'MERGED'))
+        $evidence.status = if (@($active | Where-Object { $_.sources -contains 'closing_link' }).Count) {
             'existing_upstream_fix'
+        } elseif ($active.Count) {
+            'existing_upstream_work'
         } elseif ($evidence.truncated) { 'unverified_truncated' } else { 'no_active_linked_fix' }
         $review.assessedCount++
     }
@@ -366,7 +400,7 @@ try {
                 classification = $classification
                 upstreamFixReview = @{
                     status = $(if ($classification -eq 'reported_arm64_work') { 'not_assessed' } else { 'not_applicable' })
-                    truncated = $false; pullRequests = @()
+                    truncated = $false; pullRequests = @(); referenceQuery = $null; referenceMatchCount = $null
                 }
             }
         }
