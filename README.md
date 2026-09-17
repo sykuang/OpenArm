@@ -149,6 +149,8 @@ copies those bounded passages directly from the collected source, preserving
 Markdown and Unicode and preventing paraphrases from becoming purported quotations.
 Single-source reports remain visible as `uncorroborated_report`, with a review
 warning and no recommendation; they do not abort unrelated repository reviews.
+Gap keywords must occur in the same source sentence as the Windows Arm64 context;
+an unrelated "no blockers" sentence cannot turn unverified runtime support into a gap.
 If the cited passages do not even establish the model-labelled native gap, it is
 retained as `unknown` with `no_explicit_gap_citation`, the original model label and
 an explicit warning. Invalid JSON, repository sets or source references still fail.
@@ -169,8 +171,10 @@ Windows Arm64 prebuilds and a disabled window-enumeration path; that is not proo
 that native source compilation is impossible, or that a patch has been validated.
 The focus is reviewed first, separately from the ranked batches. Each prompt lists
 the exact requested repository names; nested dependency evidence informs its
-parent's assessment rather than adding an extra result or a ranked candidate. Its result is
-retained in `focusFindings`, even if upstream work remains
+parent's assessment rather than adding an extra result or a ranked candidate.
+Dependency/component display names are bounded text, with separately validated
+upstream repository identities when identified in the evidence. The focus result
+is retained in `focusFindings`, even if upstream work remains
 uncertain. If Hermes is absent from Trending/Foundational, it is explicitly an
 additional reference check, not an invented rank in the 100-repository pool.
 The default `reviewFocus: none` does not add a reference repository.

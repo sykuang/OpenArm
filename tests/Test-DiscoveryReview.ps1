@@ -257,7 +257,21 @@ try {
     Assert ($result[0].assessment -eq 'unknown' -and $result[0].evidenceStatus -eq 'no_explicit_gap_citation' -and
         -not $result[0].eligible -and $result[0].modelAssessment -eq 'reported_missing_native_support' -and
         $result[0].reviewWarning) 'A model-labelled gap without an explicit source statement is visibly rejected, not silently promoted'
-    foreach ($case in 'passage', 'passage-type', 'foreign-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository') {
+    $answer = New-Assessment $hermes
+    $answer.scope = 'feature'
+    $answer.dependency.name = 'get-windows window enumeration'
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    Assert ($result[0].dependency.name -ceq 'get-windows window enumeration' -and
+        $result[0].dependency.repository -ceq 'sindresorhus/get-windows' -and $result[0].eligible) 'A bounded component display name is not incorrectly rejected as a package-manager identifier'
+    $source = $hermes.documents | Where-Object { $_.id -like '*stage-native-deps.mjs' } | Select-Object -First 1
+    $originalContent = $source.content
+    $source.content = Get-RepositoryExcerpt "Four independent reviews: no blockers.`nWindows ARM64 runtime verification (archive verified; runtime tested on x64)."
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @((New-Assessment $hermes)) } | ConvertTo-Json -Depth 12) @($hermes))
+    Assert ($result[0].assessment -eq 'unknown' -and $result[0].evidenceStatus -eq 'no_explicit_gap_citation' -and
+        -not $result[0].eligible) 'An unrelated no-blockers sentence cannot turn an unverified ARM64 runtime checklist into a missing-support recommendation'
+    $source.content = $originalContent
+    foreach ($case in 'passage', 'passage-type', 'foreign-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository',
+        'blank-dependency', 'long-dependency', 'control-dependency', 'wrong-dependency-type') {
         $answer = New-Assessment $hermes
         $payload = @{ schemaVersion = 2; repositories = @($answer) }
         switch ($case) {
@@ -269,6 +283,10 @@ try {
             'duplicate' { $payload.repositories += $answer }
             'wrong-repository' { $answer.fullName = 'other/project' }
             'missing-repository' { $payload.repositories = @() }
+            'blank-dependency' { $answer.dependency.name = ' ' }
+            'long-dependency' { $answer.dependency.name = 'x' * 152 }
+            'control-dependency' { $answer.dependency.name = "package`ncommand" }
+            'wrong-dependency-type' { $answer.dependency.name = @('package') }
         }
         Assert-Throws { ConvertFrom-DiscoveryReview ($payload | ConvertTo-Json -Depth 12) @($hermes) } '*'
     }

@@ -302,13 +302,15 @@ Return exactly one entry per REQUESTED_REPOSITORIES name, in any order, using th
  "reason":"short evidence-based explanation and uncertainty",
  "reviewedSurfaces":["readme","issues","pull_requests","releases"],
  "citations":[{"sourceId":"an exact supplied document id","passage":1}]}
-For a dependency use {"name":"package name","repository":"owner/repo or null"} instead of null.
+For a dependency use {"name":"package or component display name","repository":"owner/repo or null"}
+instead of null. The display name must be nonblank, at most 151 characters, with no control characters.
 Use 0-5 citations. Select the exact integer number of a supplied passage in that document.
 Do NOT generate, paraphrase or copy quotes: the caller copies the chosen source passage verbatim.
 For reported_missing_native_support cite an explicit missing/unsupported/degraded Windows Arm64
 native-support statement. Cite independent corroboration when available; otherwise say the report
 is unconfirmed. The caller will not recommend a report lacking two distinct cited sources including
 README, release or source corroboration. An absent asset alone is not a missing-support statement.
+Untested or unverified ARM64 runtime support is unknown, not evidence of missing support.
 Making native converters optional, dropping them, or disabling a feature is a workaround, not a
 native dependency fix. Do not invent dependency owners from memory; use null when not identified.
 If support is merely unknown, return unknown rather than inventing a porting candidate.
@@ -352,7 +354,8 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
         foreach ($document in $related) { $documents[$document.id] = $document }
         if ($null -ne $item.dependency) {
             if ($item.dependency -isnot [hashtable] -or $item.dependency.name -isnot [string] -or
-                $item.dependency.name -cnotmatch '^[A-Za-z0-9@][A-Za-z0-9@/_.+-]{0,150}$') { throw 'Invalid dependency identity in Copilot review.' }
+                [string]::IsNullOrWhiteSpace($item.dependency.name) -or $item.dependency.name.Length -gt 151 -or
+                $item.dependency.name -match '[\p{Cc}\p{Cf}]') { throw 'Invalid dependency identity in Copilot review.' }
             if ($null -ne $item.dependency.repository) {
                 Assert-ReviewRepositoryName $item.dependency.repository
                 $identified = $repository.dependency -and $repository.dependency.fullName -ieq $item.dependency.repository
@@ -382,9 +385,11 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
         $item.reviewWarning = $null
         if ($item.assessment -eq 'reported_missing_native_support') {
             $explicit = @($item.citations | Where-Object {
-                $_.quote -match '(?i)\b(?:windows|win32|win[-_]arm64)\b' -and
-                $_.quote -match '(?i)\b(?:arm64|aarch64)\b' -and
-                $_.quote -match '(?i)\b(?:missing|no|not|unsupported|only|absent|disable\w*|unavailable|skip\w*|lack\w*)\b'
+                @([regex]::Split($_.quote, '(?<=[.!?])\s+') | Where-Object {
+                    $_ -match '(?i)\b(?:windows|win32|win[-_]arm64)\b' -and
+                    $_ -match '(?i)\b(?:arm64|aarch64)\b' -and
+                    $_ -match '(?i)\b(?:missing|no|not|unsupported|only|absent|disable\w*|unavailable|skip\w*|lack\w*)\b'
+                }).Count -gt 0
             })
             if (-not $explicit.Count) {
                 $item.modelAssessment = $item.assessment
