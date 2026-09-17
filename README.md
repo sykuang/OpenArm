@@ -133,7 +133,7 @@ and per-batch prompts, CLI logs and usage receipts. The
 public text, source URLs, file/blob hashes, PR states and truncation indicators.
 Every selected repository is sent to Copilot, **not just title matches or
 repositories in the distribution catalog**. Each response must cover its exact
-repository set and all four review surfaces; fabricated source IDs/quotes,
+repository set and all four review surfaces; invalid source/passage references,
 missing results, authentication errors or failed batches fail the review visibly.
 No partial batch sequence is reported as a successful empty recommendation set.
 
@@ -144,6 +144,9 @@ README, release or source evidence. An empty search or absent asset alone is not
 enough. Findings distinguish project distribution, dependency and feature gaps
 from existing-support bugs, emulation and unknown support. The final report keeps
 at most one eligible candidate per source track; all assessments remain visible.
+Copilot selects numbered passages rather than generating quote text. The validator
+copies those bounded passages directly from the collected source, preserving
+Markdown and Unicode and preventing paraphrases from becoming purported quotations.
 
 `targets\discovery\distribution-channels.json` still supplies reviewed official
 registry evidence without guessing package names. NumPy's `win_arm64` wheels

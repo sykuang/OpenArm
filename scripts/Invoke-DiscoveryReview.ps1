@@ -17,6 +17,7 @@ $report = @{
     startedAt = [DateTimeOffset]::UtcNow.ToString('o'); completedAt = $null
     runId = $env:GITHUB_RUN_ID; workflowCommit = $env:GITHUB_SHA; reviewer = 'github_copilot_cli'
     nativeVerified = $false; authVerified = $false; sourceDiscoverySha256 = $null
+    citationMode = 'numbered_source_passages'
     focus = $Focus; rankedCount = 0; requestedCount = 0; assessedCount = 0
     requests = @(); batches = @(); assessments = @(); recommendations = @(); focusFindings = @()
     limits = @{ maxRankedRepositories = 100; maxFocusRepositories = 1; maxDependencyRepositories = 1
@@ -185,10 +186,10 @@ try {
             Invoke-RepairCopilot $prompt $workspace $log -PromptOnStdin -TimeoutSeconds 180 -UsageFile $usage
             $usageData = Read-Json $usage
             if ($usageData -isnot [hashtable] -or -not $usageData.Count) { throw 'Copilot did not preserve a usage receipt.' }
+            $report.authVerified = $true
             $items = @(ConvertFrom-DiscoveryReview (Get-Content -LiteralPath $log -Raw) $batch)
             $report.assessments += $items
             $report.assessedCount += $items.Count
-            $report.authVerified = $true
             $receipt.usageSha256 = (Get-FileHash -LiteralPath $usage -Algorithm SHA256).Hash.ToLowerInvariant()
             $receipt.status = 'completed'
             $receipt.completedAt = [DateTimeOffset]::UtcNow.ToString('o')

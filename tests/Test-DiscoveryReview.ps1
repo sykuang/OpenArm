@@ -126,8 +126,8 @@ function New-Assessment([hashtable] $Repository) {
         $source = $Repository.documents | Where-Object { $_.id -like '*stage-native-deps.mjs' } | Select-Object -First 1
         $release = $Repository.dependency.documents | Where-Object kind -eq 'release' | Select-Object -First 1
         $item.citations = @(
-            @{ sourceId = $source.id; quote = $global:ReviewMock.stageText },
-            @{ sourceId = $release.id; quote = $global:ReviewMock.dependencyAsset }
+            @{ sourceId = $source.id; passage = 1 },
+            @{ sourceId = $release.id; passage = 1 }
         )
     }
     $item
@@ -143,7 +143,7 @@ function global:Mock-ReviewCopilot {
     $m.agentCalls += @{ count = $repositories.Count; names = @($repositories.fullName); prompt = $Prompt }
     if ($m.agentCalls.Count -eq $m.agentFailAt) { throw 'Offline simulated Copilot request failure; no retry.' }
     Write-Json $UsageFile @{ input_tokens = 10000; output_tokens = 500; model = 'offline-fixture' }
-    Write-Json $Log @{ schemaVersion = 1; repositories = @($repositories | ForEach-Object { New-Assessment $_ }) }
+    Write-Json $Log @{ schemaVersion = 2; repositories = @($repositories | ForEach-Object { New-Assessment $_ }) }
 }
 Set-Alias -Name Invoke-RepairCopilot -Value Mock-ReviewCopilot -Scope Global
 function Run-Review([string] $Name, [string] $Phase, [string] $InputDirectory = "$root\input", [string] $Focus = 'none') {
@@ -163,6 +163,14 @@ try {
     $excerpt = Get-RepositoryExcerpt (('prefix ' * 1000) + 'Windows ARM64 native wheels are missing.' + (' tail' * 1000)) 2000
     Assert ($excerpt.truncated -and $excerpt.text.Length -le 2000 -and $excerpt.text -like '*Windows ARM64*' -and
         $excerpt.sha256 -match '^[a-f0-9]{64}$') 'Architecture excerpts preserve a bounded, hash-linked source statement'
+    $formatted = '**Windows / missing binding self-heal:** `native.node` requires a native Windows ARM64 prebuild.'
+    $passages = @(Get-ReviewPassages $formatted)
+    Assert ($passages.Count -eq 1 -and $passages[0].number -eq 1 -and $passages[0].text -ceq $formatted) 'Numbered source passages retain Markdown syntax rather than asking the model to regenerate a quote'
+    $unicodeText = ('x' * 499) + [char]::ConvertFromUtf32(0x1F680) + ('y' * 600)
+    $passages = @(Get-ReviewPassages $unicodeText)
+    Assert (@($passages | Where-Object { -not $unicodeText.Contains($_.text) -or $_.text.Length -gt 500 }).Count -eq 0) 'Passages are bounded contiguous source slices'
+    foreach ($passage in $passages) { $null = [Text.UTF8Encoding]::new($false, $true).GetBytes($passage.text) }
+    Assert ($passages.Count -eq 3) 'Passage boundaries preserve Unicode surrogate pairs'
     $prepared = Run-Review 'prepared-100' 'Prepare'
     Assert (-not $prepared.error -and $prepared.report.status -eq 'prepared' -and $prepared.report.requestedCount -eq 100 -and
         $prepared.report.assessedCount -eq 100 -and $global:ReviewMock.calls.Count -eq 110) "All 100 get README and PR content, even without issues or reviewed distributions: $($prepared.error)"
@@ -200,36 +208,41 @@ try {
     foreach ($case in 'active_native_fix', 'merged_native_fix', 'unknown') {
         $answer = New-Assessment $hermes
         $answer.upstreamDisposition = $case
-        $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+        $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
         Assert (-not $result[0].eligible) "Incomplete or existing native fixes cannot become a duplicate recommendation: $case"
     }
     $answer = New-Assessment $hermes
     $answer.scope = 'project'; $answer.dependency = $null
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'project_already_advertises_native_distribution') 'Already-native project distribution cannot be recommended as a new project port'
     $hermes.nativeSupport = 'not_a_native_port_candidate'
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'platform_independent_project_distribution') 'Portable distributions are not mistaken for projects needing a native port'
     $hermes.nativeSupport = 'native_distribution_available'
     $hermes.dependency.nativeSupport = 'native_distribution_available'
     $answer = New-Assessment $hermes
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'dependency_already_advertises_native_distribution') 'A stale application comment cannot hide an already-published native dependency'
     $hermes.dependency.nativeSupport = 'unverified'
     $hermes.dependency.coverage.pullRequestsTruncated = $true
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'upstream_work_not_fully_assessed') 'Incomplete dependency PR evidence also prevents duplicate recommendations'
     $hermes.dependency.coverage.pullRequestsTruncated = $false
     $hermes.coverage.pullRequestsTruncated = $true
     $answer = New-Assessment $hermes
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 1; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'upstream_work_not_fully_assessed') 'A reported dependency gap with truncated upstream evidence remains a follow-up, not an automatic repair'
     $hermes.coverage.pullRequestsTruncated = $false
-    foreach ($case in 'quote', 'foreign-source', 'one-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository') {
+    $answer = New-Assessment $hermes
+    $answer.citations[0].quote = 'A model-generated paraphrase must never replace the actual source.'
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    Assert ($result[0].citations[0].quote -ceq $global:ReviewMock.stageText) 'Only the selected original passage, never model-generated quote text, enters the report'
+    foreach ($case in 'passage', 'passage-type', 'foreign-source', 'one-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository') {
         $answer = New-Assessment $hermes
-        $payload = @{ schemaVersion = 1; repositories = @($answer) }
+        $payload = @{ schemaVersion = 2; repositories = @($answer) }
         switch ($case) {
-            'quote' { $answer.citations[0].quote = 'Fabricated Windows ARM64 support is missing.' }
+            'passage' { $answer.citations[0].passage = 9999 }
+            'passage-type' { $answer.citations[0].passage = '1' }
             'foreign-source' { $answer.citations[0].sourceId = 'other/project/issue-1' }
             'one-source' { $answer.citations = @($answer.citations[0]) }
             'owner' { $answer.dependency.repository = 'unrelated/owner' }

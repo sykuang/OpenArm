@@ -228,9 +228,46 @@ function Add-ReviewPullRequests([array] $Repositories, [hashtable] $State) {
     }
 }
 
+function Get-ReviewPassages([string] $Text) {
+    $passages = @()
+    foreach ($segment in $Text.Split("`n[... excerpt omitted ...]`n", [StringSplitOptions]::None)) {
+        for ($start = 0; $start -lt $segment.Length;) {
+            $end = [Math]::Min($start + 500, $segment.Length)
+            if ($end -lt $segment.Length) {
+                $boundary = $segment.LastIndexOf("`n", $end - 1, $end - $start)
+                if ($boundary -lt $start + 100) { $boundary = $segment.LastIndexOf(' ', $end - 1, $end - $start) }
+                if ($boundary -ge $start + 100) { $end = $boundary + 1 }
+                if ([char]::IsHighSurrogate($segment[$end - 1])) { $end-- }
+            }
+            $quote = $segment.Substring($start, $end - $start).Trim()
+            if ($quote) { $passages += @{ number = $passages.Count + 1; text = $quote } }
+            $start = $end
+        }
+    }
+    $passages
+}
+
+function Get-ReviewPromptRepository([hashtable] $Repository, [int] $Depth = 0) {
+    if ($Depth -gt 1) { throw 'Review context may include only one level of dependency evidence.' }
+    $result = @{
+        fullName = $Repository.fullName; scope = $Repository.scope; nativeSupport = $Repository.nativeSupport
+        coverage = $Repository.coverage; documents = @(); dependency = $null
+    }
+    foreach ($document in $Repository.documents) {
+        $result.documents += @{
+            id = $document.id; repository = $document.repository; kind = $document.kind; url = $document.url
+            details = $document.details; excerptTruncated = $document.content.truncated
+            passages = @(Get-ReviewPassages $document.content.text)
+        }
+    }
+    if ($Repository.dependency) { $result.dependency = Get-ReviewPromptRepository $Repository.dependency ($Depth + 1) }
+    $result
+}
+
 function Get-DiscoveryReviewPrompt([array] $Repositories, [string] $Question = '') {
     if (-not $Repositories.Count -or $Repositories.Count -gt 10) { throw 'Copilot review is bounded to ten repositories per prompt.' }
-    $data = ConvertTo-Json -InputObject $Repositories -Depth 30 -Compress
+    $inputRepositories = @($Repositories | ForEach-Object { Get-ReviewPromptRepository $_ })
+    $data = ConvertTo-Json -InputObject $inputRepositories -Depth 30 -Compress
     if ($data.Length -gt 400000) { throw 'Prepared Copilot batch exceeds 400,000 characters; no partial review was substituted.' }
     @"
 Review EVERY repository in DATA for missing NATIVE Windows Arm64 support. Read its README,
@@ -246,7 +283,7 @@ and unknown evidence. Do not claim native execution or a reproduced failure.
 Inspect PR substance: an OPEN native fix is existing work; a MERGED native fix may resolve a
 stale report. A merged feature-disabling/emulation workaround is not a native fix. Unrelated
 PRs or body references alone are not fixes. Report truncated/missing evidence honestly.
-Return ONLY one JSON object: {"schemaVersion":1,"repositories":[...]}.
+Return ONLY one JSON object: {"schemaVersion":2,"repositories":[...]}.
 Return exactly one entry per DATA repository, in any order, using this shape:
 {"fullName":"owner/repo",
  "assessment":"reported_missing_native_support|existing_native_support|existing_support_bug|emulation_only|unknown",
@@ -255,12 +292,13 @@ Return exactly one entry per DATA repository, in any order, using this shape:
  "upstreamDisposition":"no_native_fix_identified|active_native_fix|merged_native_fix|workaround_only|unknown",
  "reason":"short evidence-based explanation and uncertainty",
  "reviewedSurfaces":["readme","issues","pull_requests","releases"],
- "citations":[{"sourceId":"an exact supplied document id","quote":"an exact contiguous quote from its content.text"}]}
+ "citations":[{"sourceId":"an exact supplied document id","passage":1}]}
 For a dependency use {"name":"package name","repository":"owner/repo or null"} instead of null.
-Use 0-5 citations, each an exact 20-600 character quote; no fabricated IDs, URLs or ellipses.
-For reported_missing_native_support supply at least TWO distinct cited sources: one explicit
-Windows Arm64 missing/unsupported/degraded native-support statement, and corroborating README,
-release or source evidence. An absent asset by itself is not a missing-support statement.
+Use 0-5 citations. Select the exact integer number of a supplied passage in that document.
+Do NOT generate, paraphrase or copy quotes: the caller copies the chosen source passage verbatim.
+For reported_missing_native_support cite at least TWO distinct source documents. One selected
+passage must explicitly report missing/unsupported/degraded Windows Arm64 native support, with
+corroborating README, release or source evidence. An absent asset alone is not such a statement.
 If support is merely unknown, return unknown rather than inventing a porting candidate.
 Do not infer dependency ownership unless the supplied evidence identifies it.
 Focus question (if any): $Question
@@ -275,7 +313,7 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
     if ($json -match '(?s)^```(?:json)?\s*(\{.*\})\s*```$') { $json = $Matches[1] }
     try { $result = ConvertFrom-Json $json -AsHashtable -Depth 32 }
     catch { throw 'Copilot did not return valid review JSON; no recommendation is accepted.' }
-    if ($result -isnot [hashtable] -or $result.schemaVersion -ne 1 -or
+    if ($result -isnot [hashtable] -or $result.schemaVersion -ne 2 -or
         $result.repositories -isnot [array] -or $result.repositories.Count -ne $Repositories.Count) {
         throw 'Copilot review did not cover the exact requested repository set.'
     }
@@ -313,13 +351,16 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
         $cited = @{}
         foreach ($citation in $item.citations) {
             if ($citation -isnot [hashtable] -or $citation.sourceId -isnot [string] -or
-                -not $documents.ContainsKey($citation.sourceId) -or $citation.quote -isnot [string] -or
-                $citation.quote.Length -lt 20 -or $citation.quote.Length -gt 600 -or
-                $citation.quote.Contains('[... excerpt omitted ...]') -or
-                -not $documents[$citation.sourceId].content.text.Contains($citation.quote)) {
-                throw 'Copilot returned a fabricated or non-exact evidence citation.'
+                -not $documents.ContainsKey($citation.sourceId) -or
+                ($citation.passage -isnot [int] -and $citation.passage -isnot [long])) {
+                throw "Copilot returned an invalid source-passage reference for $($item.fullName)."
             }
             $document = $documents[$citation.sourceId]
+            $passages = @(Get-ReviewPassages $document.content.text)
+            if ($citation.passage -lt 1 -or $citation.passage -gt $passages.Count) {
+                throw "Copilot selected a source passage that was not supplied for $($item.fullName)."
+            }
+            $citation.quote = $passages[$citation.passage - 1].text
             $citation.url = $document.url
             $citation.kind = $document.kind
             $cited[$document.id] = $document
@@ -332,7 +373,7 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
             })
             if ($cited.Count -lt 2 -or -not $explicit.Count -or
                 -not @($cited.Values | Where-Object kind -in @('readme', 'release', 'source')).Count) {
-                throw 'A missing-support finding lacks explicit, corroborated Windows Arm64 evidence.'
+                throw "The missing-support finding for $($item.fullName) lacks explicit, corroborated Windows Arm64 evidence."
             }
         }
         $item.provisional = $true
