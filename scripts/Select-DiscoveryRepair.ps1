@@ -33,6 +33,9 @@ try {
         $path = Join-Path (Resolve-OutputPath $InputPath $OutputRoot) 'report.json'
         if ((Get-Item -LiteralPath $path).Length -gt 16MB) { throw 'Discovery review exceeds the handoff size limit.' }
         $review = Read-Json $path
+        if ($review.evidencePolicyVersion -ne 2) {
+            throw 'This discovery report predates cause and closure-discussion review. Run discovery again; an older missing-support recommendation cannot authorize repair.'
+        }
         if ($review.schemaVersion -ne 1 -or $review.phase -ne 'Agent' -or $review.status -ne 'completed' -or
             $review.reviewer -ne 'github_copilot_cli' -or $review.authVerified -ne $true -or $review.nativeVerified -ne $false -or
             $review.citationMode -ne 'numbered_source_passages' -or
@@ -51,6 +54,9 @@ try {
                 $assessments.Count -ne 1 -or $assessments[0].fullName -cnotmatch '^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$' -or
                 $assessments[0].eligible -ne $true -or $assessments[0].assessment -ne 'reported_missing_native_support' -or
                 $assessments[0].evidenceStatus -ne 'corroborated_report' -or
+                $assessments[0].blockerKind -notin @('source_gap', 'native_dependency_gap', 'build_distribution_gap') -or
+                $assessments[0].rootCauseEvidenceStatus -ne 'cited' -or
+                $assessments[0].closedPrReviewStatus -notin @('not_applicable', 'author_withdrew') -or
                 $assessments[0].eligibilityReason -ne 'provisional_reported_native_gap' -or
                 $assessments[0].tracks -cnotcontains $recommendation.track -or $assessments[0].reviewScope -ne 'ranked' -or
                 $assessments[0].upstreamDisposition -notin @('no_native_fix_identified', 'workaround_only') -or
@@ -67,7 +73,9 @@ try {
         } else {
             $candidate = $review.assessments | Where-Object fullName -ceq $recommendation.fullName | Select-Object -First 1
             $report.candidate = @{ fullName = $candidate.fullName; track = $recommendation.track; scope = $candidate.scope
-                dependency = $candidate.dependency; citations = $candidate.citations }
+                dependency = $candidate.dependency; citations = $candidate.citations
+                blockerKind = $candidate.blockerKind; blockerCitation = $candidate.blockerCitation
+                closedPrReviewStatus = $candidate.closedPrReviewStatus }
             $owner = if ($candidate.scope -eq 'project') { $candidate.fullName }
                 elseif ($candidate.dependency) { $candidate.dependency.repository } else { $null }
             $report.status = 'needs_human'

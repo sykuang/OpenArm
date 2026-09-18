@@ -13,7 +13,7 @@ $Output = Resolve-OutputPath $Output $OutputRoot
 if (Test-Path -LiteralPath $Output) { throw 'Review output already exists; choose a fresh directory.' }
 $null = New-Item -ItemType Directory -Path $Output
 $report = @{
-    schemaVersion = 1; phase = $Phase; status = 'starting'; error = $null
+    schemaVersion = 1; evidencePolicyVersion = 2; phase = $Phase; status = 'starting'; error = $null
     startedAt = [DateTimeOffset]::UtcNow.ToString('o'); completedAt = $null
     runId = $env:GITHUB_RUN_ID; workflowCommit = $env:GITHUB_SHA; reviewer = 'github_copilot_cli'
     nativeVerified = $false; authVerified = $false; sourceDiscoverySha256 = $null
@@ -23,14 +23,17 @@ $report = @{
     requests = @(); batches = @(); assessments = @(); recommendations = @(); focusFindings = @()
     limits = @{ maxRankedRepositories = 100; maxFocusRepositories = 1; maxDependencyRepositories = 1
         maxPreparationRequests = 150; maxRepositoriesPerPrompt = 10; maxAgentCalls = 11
+        maxDiscussionCharactersPerRepository = 9000
         maxPromptDataCharacters = 400000; maxAgentSecondsPerCall = 180; maxResponseCharacters = 100000 }
     limitations = @(
         'All results are provisional analysis of public text, not native builds or execution proof.'
         'Every ranked repository is reviewed, including unconfigured distribution channels and non-matching issue titles.'
         'README text is bounded to 6,000 characters; issue and PR text to about 2,000 each. Excerpts retain hashes and truncation. Only five matching issues and five PRs per repository are included.'
+        'Each sampled PR includes its latest four comments, two review summaries and two close/reopen events; each sampled issue includes its latest three comments. Discussion text is at most 1,000 characters per item and 9,000 per repository. Omitted pages, text or inline reviews block automatic recommendations.'
         'Missing matches, truncated evidence or absent packages alone do not prove missing native support. Uncorroborated reports remain explicit human follow-ups, not recommendations or fatal schema errors.'
         'A native parent installer cannot prove that an optional native dependency or disabled feature works. Source-build feasibility still requires native reproduction.'
         'Open/merged native fixes exclude duplicate recommendations; merged disabled-feature/emulation workarounds are not native fixes. Incomplete PR searches require human review.'
+        'Closed/unmerged PRs do not imply available work. Maintainer deferrals/rejections, upstream prerequisites, unexplained closures and uncited underlying causes are not automatic repair recommendations.'
         'The named focus is outside the ranked pool unless independently present there; it never invents a source rank.'
         'Copilot receives prepared public evidence over standard input with no tools, custom instructions, MCPs or target execution. There are no AI or network retries and no automatic edits, forks or PRs.'
     )
@@ -67,19 +70,22 @@ function Save-ReviewMarkdown {
         if ($item.assessment -ne 'reported_missing_native_support' -and $item.fullName -notin @($report.focusFindings | ForEach-Object fullName)) { continue }
         $lines.Add("### $($item.fullName)")
         $lines.Add("Assessment: $($item.assessment); evidence $($item.evidenceStatus); scope $($item.scope); upstream $($item.upstreamDisposition); eligibility $($item.eligibilityReason).")
+        $lines.Add("Underlying cause: $($item.blockerKind) ($($item.rootCauseEvidenceStatus)); closed PR review: $($item.closedPrReviewStatus).")
         $lines.Add((ConvertTo-ReviewMarkdown $item.reason))
         if ($item.reviewWarning) { $lines.Add("Review warning: $(ConvertTo-ReviewMarkdown $item.reviewWarning)") }
         if ($item.dependency) { $lines.Add("Dependency: $(ConvertTo-ReviewMarkdown $item.dependency.name); owner $(ConvertTo-ReviewMarkdown $item.dependency.repository).") }
-        foreach ($citation in $item.citations) {
+        $references = @($item.citations)
+        if ($item.blockerCitation) { $references += $item.blockerCitation }
+        foreach ($citation in @($references | Sort-Object sourceId, passage -Unique)) {
             $lines.Add("- [$(ConvertTo-ReviewMarkdown $citation.sourceId)]($($citation.url)): $(ConvertTo-ReviewMarkdown $citation.quote)")
         }
     }
     $lines.Add('')
     $lines.Add('## All repository assessments')
-    $lines.Add('| Repository | Review scope | Assessment | Evidence status | Native gap scope | Upstream disposition |')
-    $lines.Add('| --- | --- | --- | --- | --- | --- |')
+    $lines.Add('| Repository | Review scope | Assessment | Evidence status | Native gap scope | Underlying cause | Closed PR review | Upstream disposition |')
+    $lines.Add('| --- | --- | --- | --- | --- | --- | --- | --- |')
     foreach ($item in $report.assessments) {
-        $lines.Add("| $($item.fullName) | $($item.reviewScope) | $($item.assessment) | $($item.evidenceStatus) | $($item.scope) | $($item.upstreamDisposition) |")
+        $lines.Add("| $($item.fullName) | $($item.reviewScope) | $($item.assessment) | $($item.evidenceStatus) | $($item.scope) | $($item.blockerKind) | $($item.closedPrReviewStatus) | $($item.upstreamDisposition) |")
     }
     $lines.Add('')
     $lines.Add('## Limits')
@@ -102,7 +108,7 @@ try {
             $discovery.distributionAssessedCount -ne $discovery.requestedCount) { throw 'Review requires a completed, bounded discovery evidence set.' }
         $report.sourceDiscoverySha256 = (Get-FileHash -LiteralPath $discoveryPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $report.rankedCount = $discovery.repositories.Count
-        $context = @{ schemaVersion = 1; sourceDiscoverySha256 = $report.sourceDiscoverySha256
+        $context = @{ schemaVersion = 1; evidencePolicyVersion = 2; sourceDiscoverySha256 = $report.sourceDiscoverySha256
             runId = $env:GITHUB_RUN_ID; workflowCommit = $env:GITHUB_SHA
             focus = $Focus; focusRepository = $null; focusQuestion = ''; repositories = @() }
         $seen = @{}
@@ -152,6 +158,7 @@ try {
         if ((Get-Item -LiteralPath $contextPath).Length -gt 16MB) { throw 'Prepared review context exceeds 16 MiB.' }
         $context = Read-Json $contextPath
         if ($prepared.phase -ne 'Prepare' -or $prepared.status -ne 'prepared' -or $context.schemaVersion -ne 1 -or
+            $prepared.evidencePolicyVersion -ne 2 -or $context.evidencePolicyVersion -ne 2 -or
             $context.runId -cne $env:GITHUB_RUN_ID -or $context.workflowCommit -cne $env:GITHUB_SHA -or
             $context.sourceDiscoverySha256 -cne $prepared.sourceDiscoverySha256 -or
             $context.repositories -isnot [array] -or $context.repositories.Count -lt 1 -or $context.repositories.Count -gt 101 -or
@@ -172,14 +179,18 @@ try {
         $normal = @($context.repositories | Where-Object fullName -ne $context.focusRepository)
         for ($i = 0; $i -lt $normal.Count; $i += 10) { $batches.Add(@($normal | Select-Object -Skip $i -First 10)) }
         if ($batches.Count -gt 11) { throw 'Copilot review exceeded eleven bounded calls.' }
+        $prompts = @(foreach ($batch in $batches) {
+            $question = if ($batch.fullName -contains $context.focusRepository) { $context.focusQuestion } else { '' }
+            Get-DiscoveryReviewPrompt $batch $question
+        })
         foreach ($batch in $batches) {
             $number = $report.batches.Count + 1
             $prefix = 'batch-{0:D2}' -f $number
-            $question = if ($batch.fullName -contains $context.focusRepository) { $context.focusQuestion } else { '' }
-            $prompt = Get-DiscoveryReviewPrompt $batch $question
+            $prompt = $prompts[$number - 1]
             $promptPath = Join-Path $Output "$prefix.prompt.txt"
             [IO.File]::WriteAllText($promptPath, $prompt, [Text.UTF8Encoding]::new($false))
             $receipt = @{ number = $number; repositories = @($batch.fullName); status = 'running'
+                promptCharacters = $prompt.Length
                 promptSha256 = (Get-FileHash -LiteralPath $promptPath -Algorithm SHA256).Hash.ToLowerInvariant()
                 log = "$prefix.log"; usage = "$prefix.usage.json"; completedAt = $null }
             $report.batches += $receipt

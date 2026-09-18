@@ -10,7 +10,7 @@ remain explicit human blockers, not compatibility-success results.
 Use the manual GitHub Actions workflow to discover Trending and Foundational repositories with
 reported Windows Arm64 work or create a documentation-only draft PR inside your
 fork. Discovery now uses **Copilot CLI inside the Action** to review README text,
-issue/PR bodies and states, releases and supplied dependency evidence for every
+issue/PR bodies, discussions and closure decisions, releases and supplied dependency evidence for every
 selected repository. It uses GitHub's hosted Windows Arm64 runner; no Azure DevOps
 setup or self-hosted worker is needed.
 
@@ -130,7 +130,8 @@ The **final content review** is in
 `discovery-copilot-review-<run-id>-<attempt>`: `copilot-review.md`, `report.json`,
 and per-batch prompts, CLI logs and usage receipts. The
 `discovery-review-context-<run-id>-<attempt>` artifact preserves the prepared
-public text, source URLs, file/blob hashes, PR states and truncation indicators.
+public text, source URLs, file/blob hashes, PR states, discussion authors, closure
+actors/dates and truncation indicators.
 Every selected repository is sent to Copilot, **not just title matches or
 repositories in the distribution catalog**. Each response must cover its exact
 repository set and all four review surfaces; invalid source/passage references,
@@ -156,6 +157,21 @@ an unrelated "no blockers" sentence cannot turn unverified runtime support into 
 If the cited passages do not even establish the model-labelled native gap, it is
 retained as `unknown` with `no_explicit_gap_citation`, the original model label and
 an explicit warning. Invalid JSON, repository sets or source references still fail.
+
+**The review must explain why support is missing, not just identify a missing
+binary.** Model reply schema 3 records `blockerKind`, a source-linked
+`blockerCitation`, and `closedPrDisposition`. The report retains the underlying
+cause, its citation status and the validated closure-review status. Missing or
+uncited causes remain human follow-ups. Maintainer policy, deferred/rejected
+proposals, upstream prerequisites and unexplained or superseded closed PRs cannot
+be automatic repair recommendations. Every supplied closed PR needs a cited
+discussion from that PR; voluntary withdrawal also requires its author to be the
+closing actor. Earlier bot closures that were reopened are not final decisions.
+For example, Azahar PR 2062 was deferred in its
+[June 17 closing comment](https://github.com/azahar-emu/azahar/pull/2062#issuecomment-4735193886)
+pending the preferred MXE build environment, with MSYS2 deprecated and MSVC
+unacceptable to the maintainer. "Closed, unmerged" does not invite another
+MSYS2/MSVC port, nor prove native Windows Arm64 builds impossible.
 
 `targets\discovery\distribution-channels.json` still supplies reviewed official
 registry evidence without guessing package names. NumPy's `win_arm64` wheels
@@ -231,13 +247,20 @@ adds at most **150 read-only GitHub requests**: one README per selected reposito
 PR searches grouped into queries of at most ten repositories, and bounded files,
 metadata, issues and releases for the optional focus and its one named dependency.
 PR searches inspect five matching bodies and include authoritative OPEN/CLOSED/
-MERGED state. README responses must be UTF-8 text within 1 MiB; the CLI receives
+MERGED state, the latest four comments, two review summaries and two close/reopen
+events per PR. Each sampled issue includes its latest three comments in the same
+bounded GraphQL queries, without additional HTTP requests. Discussion text is
+limited to 1,000 characters per item and 9,000 per repository; omitted pages,
+text or inline review threads explicitly block automatic recommendations.
+README responses must be UTF-8 text within 1 MiB; the CLI receives
 up to 6,000 README characters and about 2,000 characters per issue/PR, with
 architecture-focused excerpts and truncation recorded. Focus source files are
 bounded to 64 Ki characters each. Release summaries include bounded asset names,
 not downloaded executable source. A prompt contains at most 400,000 data
-characters and a response at most 100,000. Issue/PR comments and arbitrary linked
-pages are not crawled; incomplete evidence must remain explicit.
+characters and a response at most 100,000. All batch sizes are checked before the
+first paid call; receipts retain exact prompt lengths. Older discussion pages, inline review
+threads and arbitrary linked pages are not crawled; incomplete evidence remains
+explicit rather than implying that no maintainer decision exists.
 The Trending source adds **at most nine anonymous HTML GETs**, each limited to **2 MiB and 30 seconds**
 with no redirects, cookies or credentials. Changed/malformed markup, missing weekly
 counts or source failures stop the scan visibly; it never falls back to a
@@ -437,6 +460,10 @@ job verifies that the source is a successful manual discovery run from this
 repository's default branch, downloads that attempt's review, and checks its run,
 commit, completion, authentication and recommendation eligibility. It reuses
 the actual review instead of paying to rescan the same 100 repositories.
+Both preparation and review require `evidencePolicyVersion: 2`; older reports
+must be regenerated because they lack cause and closure-discussion evidence.
+Handoff rechecks a cited actionable cause and resolved closure status, so old
+or deferred recommendations cannot authorize repair.
 It selects the eligible Trending recommendation first, otherwise Foundational.
 For a dependency gap it selects the identified dependency owner, not the parent.
 No recommendation means no fallback target.
@@ -447,9 +474,10 @@ produce **`needs_human`** in `repair-selection-*`, with the exact native
 build/tests/install/core-workflow gap; all execution and publication jobs are
 skipped. Selection does not invent executable build instructions from AI text,
 repurpose an unrelated diagnosis-only task, or create a documentation PR.
-The current tracked tasks contain no external native repair adapter, so a
-discovered project such as Azahar is selected automatically but remains blocked
-until that project's native validation recipe and scope are reviewed.
+The current tracked tasks contain no external native repair adapter, so even an
+actionable discovered project remains blocked until its native validation recipe
+and scope are reviewed. Azahar's known maintainer deferral excludes it before
+adapter selection; the older recommendation lacked that closing discussion.
 
 Enable **`publishDraft`** and **`createFork`** to allow the isolated publisher to
 create the reviewed destination fork if absent, then publish the independently
@@ -621,7 +649,8 @@ This trial is **not a native porting patch or agent-benchmark result**.
 synthetic credentials; `tests\Test-RepositoryDiscovery.ps1` covers read-only
 discovery, ranking, evidence limits, partial failures and token separation.
 `tests\Test-DiscoveryReview.ps1` covers all-100 content review, the Hermes dependency
-case, exact citations, workflow binding and partial AI/network failures with offline
+case, Azahar's actual closing explanation, discussion bounds, cause/closure gates,
+exact citations, workflow binding and partial AI/network failures with offline
 doubles. `tests\Test-CopilotRepair.ps1` also checks UTF-8 stdin beyond the Windows
 command-line limit and a child that never reads it.
 Repository CI never uses real GitHub tokens, performs live discovery or calls paid AI.

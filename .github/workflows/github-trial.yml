@@ -102,7 +102,7 @@ jobs:
           OPENARM_GITHUB_TRIAL_CREATE: ${{ inputs.createForkPullRequest }}
           OPENARM_GITHUB_TRIAL_ID: ${{ github.repository_id }}-${{ github.run_id }}
           OPENARM_GITHUB_TOKEN: ${{ secrets.OPENARM_GITHUB_TOKEN }}
-      - name: Prepare README, issue bodies, PR bodies and states, releases and named dependency evidence
+      - name: Prepare README, issue and PR discussions, closure decisions, releases and dependency evidence
         if: ${{ inputs.sourceRepositoryUrl == '' }}
         run: .\scripts\Invoke-DiscoveryReview.ps1 -Phase Prepare -InputPath "$env:RUNNER_TEMP\github-trial" -Output "$env:RUNNER_TEMP\review-context" -OutputRoot "$env:RUNNER_TEMP"
         env:
@@ -170,7 +170,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Copilot CLI version check failed.' }
           Get-FileHash -LiteralPath $copilotExe -Algorithm SHA256 | Format-List
           Split-Path -Parent $copilotExe | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
-      - name: Run bounded Copilot content review of every repository and the named focus
+      - name: Review native gaps, underlying causes and maintainer decisions with Copilot
         run: .\scripts\Invoke-DiscoveryReview.ps1 -Phase Agent -InputPath "$env:RUNNER_TEMP\review-context" -Output "$env:RUNNER_TEMP\copilot-review" -OutputRoot "$env:RUNNER_TEMP"
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -249,7 +249,7 @@ jobs:
             }
             const reason = failed
               ? 'The trial, Copilot review or evidence publication failed. A human must inspect the run logs and resolve the blocker.'
-              : 'Copilot missing-support review completed. A human must review the cited README, issue/PR bodies, releases, dependency ownership and existing native fixes before selecting a porting candidate. A native parent installer or a disabled-feature workaround does not establish native dependency support. Ordinary bugs, emulation and unknown support are not new-port recommendations. If no candidate qualifies, inspect missing evidence and review limits rather than inventing a port.';
+              : 'Copilot missing-support review completed. A human must review the cited README, issue/PR discussions, closure decisions, releases, dependency ownership and underlying cause before selecting a porting candidate. Closed/unmerged proposals do not imply available work: maintainer deferrals, rejected approaches, upstream prerequisites and unknown causes require review, not automatic repair. A native parent installer or a disabled-feature workaround does not establish native dependency support. Ordinary bugs, emulation and unknown support are not new-port recommendations. If no candidate qualifies, inspect missing evidence and review limits rather than inventing a port.';
             const body = [
               marker, '', '## Human help needed', '', reason, '',
               `Workflow run and all rerun attempts: ${runUrl}`, '',

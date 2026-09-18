@@ -20,12 +20,14 @@ $task = @{
 }
 function New-Review {
     @{
-        schemaVersion = 1; phase = 'Agent'; status = 'completed'; reviewer = 'github_copilot_cli'
+        schemaVersion = 1; evidencePolicyVersion = 2; phase = 'Agent'; status = 'completed'; reviewer = 'github_copilot_cli'
         authVerified = $true; nativeVerified = $false; citationMode = 'numbered_source_passages'
         runId = '123'; workflowCommit = 'b' * 40; requestedCount = 1; assessedCount = 1
         assessments = @(@{
             fullName = 'upstream/widget'; eligible = $true; assessment = 'reported_missing_native_support'
             evidenceStatus = 'corroborated_report'; eligibilityReason = 'provisional_reported_native_gap'
+            blockerKind = 'source_gap'; rootCauseEvidenceStatus = 'cited'; closedPrReviewStatus = 'not_applicable'
+            blockerCitation = @{ sourceId = 'upstream/widget/issue-1'; passage = 1 }
             reviewScope = 'ranked'; tracks = @('trending'); upstreamDisposition = 'no_native_fix_identified'
             scope = 'project'; dependency = $null
             citations = @(@{ kind = 'issue'; url = 'https://github.com/upstream/widget/issues/1' },
@@ -91,7 +93,8 @@ try {
     $result = Run-Selection priority $review
     Assert ($result.report.candidate.fullName -eq 'upstream/widget' -and $result.report.candidate.track -eq 'trending') 'Trending then Foundational selection is deterministic, not dependent on array order'
     foreach ($case in 'run', 'sha', 'incomplete', 'failed', 'unauthenticated', 'duplicate', 'unknown', 'uncorroborated',
-        'unranked', 'active-fix', 'wrong-track', 'duplicate-track', 'missing-assessment') {
+        'unranked', 'active-fix', 'wrong-track', 'duplicate-track', 'missing-assessment',
+        'old-policy', 'unknown-cause', 'upstream-prerequisite', 'maintainer-deferred') {
         $review = New-Review
         switch ($case) {
             'run' { $review.runId = '124' }
@@ -107,6 +110,10 @@ try {
             'wrong-track' { $review.recommendations[0].track = 'foundational' }
             'duplicate-track' { $review.recommendations += $review.recommendations[0] }
             'missing-assessment' { $review.recommendations[0].fullName = 'elsewhere/widget' }
+            'old-policy' { $review.Remove('evidencePolicyVersion') }
+            'unknown-cause' { $review.assessments[0].rootCauseEvidenceStatus = 'unknown' }
+            'upstream-prerequisite' { $review.assessments[0].blockerKind = 'upstream_prerequisite' }
+            'maintainer-deferred' { $review.assessments[0].closedPrReviewStatus = 'maintainer_deferred' }
         }
         $result = Run-Selection $case $review
         Assert ($result.error -and $result.report.status -eq 'failed' -and -not $result.report.taskId) "Reject invalid handoff without a fallback task: $case"

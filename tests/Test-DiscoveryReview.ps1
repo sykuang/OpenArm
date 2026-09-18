@@ -36,6 +36,7 @@ function Reset-Mock {
     $env:GITHUB_RUN_ID = '101'; $env:GITHUB_SHA = 'a' * 40; $env:GITHUB_ACTIONS = 'true'; $env:OPENARM_DISCOVERY_FOCUS = 'none'
     $global:ReviewMock = @{
         calls = @(); agentCalls = @(); failAt = 0; agentFailAt = 0; fileError = ''; prError = ''
+        prNodes = @{}; issueComments = @{}
         stageText = 'The get-windows package has no Windows ARM64 prebuilt; preserve the desktop build and disable window enumeration.'
         dependencyAsset = 'napi-9-win32-unknown-x64.tar.gz'
     }
@@ -46,6 +47,10 @@ function Reset-Mock {
     }
 }
 function global:Start-Sleep { param($Seconds) }
+function New-DiscussionConnection([array] $Nodes = @(), [int] $Total = -1) {
+    if ($Total -lt 0) { $Total = $Nodes.Count }
+    @{ totalCount = $Total; nodes = $Nodes; pageInfo = @{ hasPreviousPage = ($Total -gt $Nodes.Count) } }
+}
 function global:Invoke-RestMethod {
     param($Uri, $Headers, $Method, $TimeoutSec, $MaximumRedirection, [switch] $SkipHttpErrorCheck, $StatusCodeVariable,
         $ErrorAction, $ContentType, $Body)
@@ -70,9 +75,27 @@ function global:Invoke-RestMethod {
             $nodes = @()
             if ($name -eq 'NousResearch/hermes-agent') {
                 $nodes += @{ number = 7; url = "https://github.com/$name/pull/7"; title = 'Keep desktop packaging working'
-                    body = $m.stageText; state = 'MERGED'; merged = $true; repository = @{ nameWithOwner = $name } }
+                    body = $m.stageText; state = 'MERGED'; merged = $true; repository = @{ nameWithOwner = $name }
+                    author = @{ login = 'maintainer' }; closedAt = '2026-06-17T20:44:43Z'
+                    comments = New-DiscussionConnection; reviews = New-DiscussionConnection; timelineItems = New-DiscussionConnection }
             }
+            if ($m.prNodes.ContainsKey($name)) { $nodes = @($m.prNodes[$name]) }
             $data['r' + $query.Groups[1].Value] = @{ issueCount = $nodes.Count; nodes = $nodes; pageInfo = @{ hasNextPage = $false } }
+            $index = [int]$query.Groups[1].Value
+            $start = $payload.query.IndexOf("d${index}: repository(")
+            if ($start -ge 0) {
+                $end = $payload.query.IndexOf("r$($index + 1): search", $start)
+                if ($end -lt 0) { $end = $payload.query.Length }
+                $discussion = @{ nameWithOwner = $name }
+                foreach ($entry in [regex]::Matches($payload.query.Substring($start, $end - $start), 'i(\d+): issue\(number: ([1-9][0-9]*)\)')) {
+                    $number = [int]$entry.Groups[2].Value
+                    $key = "$name/$number"
+                    $comments = if ($m.issueComments.ContainsKey($key)) { $m.issueComments[$key] } else { New-DiscussionConnection }
+                    $discussion['i' + $entry.Groups[1].Value] = @{ number = $number; url = "https://github.com/$name/issues/$number"
+                        state = 'OPEN'; comments = $comments }
+                }
+                $data["d$index"] = $discussion
+            }
         }
         if ($m.prError -eq 'missing') { $data.Remove('r0') }
         $response = @{ data = $data }
@@ -116,21 +139,68 @@ function New-Assessment([hashtable] $Repository) {
     $item = @{
         fullName = $Repository.fullName; assessment = 'unknown'; scope = 'project'; dependency = $null
         upstreamDisposition = 'unknown'; reason = 'The supplied public evidence does not establish a native gap.'
+        blockerKind = 'unknown'; blockerCitation = $null; closedPrDisposition = 'none'
         reviewedSurfaces = @('readme', 'issues', 'pull_requests', 'releases'); citations = @()
     }
     if ($Repository.fullName -eq 'NousResearch/hermes-agent') {
         $item.assessment = 'reported_missing_native_support'; $item.scope = 'dependency'
         $item.dependency = @{ name = 'get-windows'; repository = 'sindresorhus/get-windows' }
         $item.upstreamDisposition = 'workaround_only'
+        $item.blockerKind = 'native_dependency_gap'
         $item.reason = 'The native desktop package disables window enumeration when its dependency is absent; this is not a native feature fix.'
         $source = $Repository.documents | Where-Object { $_.id -like '*stage-native-deps.mjs' } | Select-Object -First 1
         $release = $Repository.dependency.documents | Where-Object kind -eq 'release' | Select-Object -First 1
+        $item.blockerCitation = @{ sourceId = $source.id; passage = 1 }
         $item.citations = @(
             @{ sourceId = $source.id; passage = 1 },
             @{ sourceId = $release.id; passage = 1 }
         )
     }
     $item
+}
+function New-AzaharReview {
+    $name = 'azahar-emu/azahar'
+    $url = "https://github.com/$name/pull/2062"
+    $closing = "For now, we've decided not to pursue this. We would like to be able to make use of the MXE build environment to provide builds, as our MSYS2 builds are deprecated and MSVC is proprietary and has proven itself to be unreliable, however MXE doesn't yet support Windows for ARM.`r`n`r`nI will be closing this for now, but hopefully we can support Windows for ARM in the future."
+    $global:ReviewMock.prNodes[$name] = @(@{
+        number = 2062; url = $url; title = 'Windows ARM64'; body = 'Native Windows ARM64 build proposal.'
+        state = 'CLOSED'; merged = $false; repository = @{ nameWithOwner = $name }
+        author = @{ login = 'talynone' }; closedAt = '2026-06-17T20:44:43Z'
+        comments = New-DiscussionConnection @(
+            @{ url = "$url#issuecomment-1"; body = 'Verification required; closing automatically.'
+                author = @{ login = 'verification[bot]' }; authorAssociation = 'NONE'
+                createdAt = '2026-04-25T00:00:00Z'; updatedAt = '2026-04-25T00:00:00Z' },
+            @{ url = "$url#issuecomment-4735193886"; body = $closing
+                author = @{ login = 'OpenSauce04' }; authorAssociation = 'MEMBER'
+                createdAt = '2026-06-17T20:44:43Z'; updatedAt = '2026-06-17T20:44:43Z' })
+        reviews = New-DiscussionConnection
+        timelineItems = New-DiscussionConnection @(
+            @{ __typename = 'ReopenedEvent'; createdAt = '2026-04-25T01:00:00Z'; actor = @{ login = 'talynone' } },
+            @{ __typename = 'ClosedEvent'; createdAt = '2026-06-17T20:44:43Z'; actor = @{ login = 'OpenSauce04' } }) 3
+    })
+    $collected = New-CollectedRepository 1
+    $collected.fullName = $name
+    $repository = New-ReviewRepository $collected
+    $repository.documents += New-ReviewDocument $name 'readme' 'readme' "https://github.com/$name" `
+        'Windows ARM64 release builds are not available.'
+    Add-ReviewPullRequests @($repository) @{ requests = @() }
+    $repository
+}
+function New-GapAssessment([hashtable] $Repository) {
+    $answer = New-Assessment $Repository
+    $answer.assessment = 'reported_missing_native_support'
+    $answer.upstreamDisposition = 'no_native_fix_identified'
+    $answer.blockerKind = 'upstream_prerequisite'
+    $answer.closedPrDisposition = 'maintainer_deferred'
+    $answer.reason = 'The maintainer deferred distribution pending the preferred MXE toolchain, not a demonstrated impossibility of native builds.'
+    $answer.citations = @(
+        @{ sourceId = "$($Repository.fullName)/readme"; passage = 1 },
+        @{ sourceId = "$($Repository.fullName)/release"; passage = 1 })
+    $answer.blockerCitation = @{ sourceId = "$($Repository.fullName)/pr-2062-issuecomment-4735193886"; passage = 1 }
+    $answer
+}
+function Read-Assessment([hashtable] $Answer, [hashtable] $Repository) {
+    @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($Answer) } | ConvertTo-Json -Depth 12) @($Repository))[0]
 }
 function global:Mock-ReviewCopilot {
     param($Prompt, $WorkingDirectory, $Log, $EditableFiles, [switch] $PromptOnStdin, $TimeoutSeconds, $UsageFile)
@@ -143,7 +213,7 @@ function global:Mock-ReviewCopilot {
     $m.agentCalls += @{ count = $repositories.Count; names = @($repositories.fullName); prompt = $Prompt }
     if ($m.agentCalls.Count -eq $m.agentFailAt) { throw 'Offline simulated Copilot request failure; no retry.' }
     Write-Json $UsageFile @{ input_tokens = 10000; output_tokens = 500; model = 'offline-fixture' }
-    Write-Json $Log @{ schemaVersion = 2; repositories = @($repositories | ForEach-Object { New-Assessment $_ }) }
+    Write-Json $Log @{ schemaVersion = 3; repositories = @($repositories | ForEach-Object { New-Assessment $_ }) }
 }
 Set-Alias -Name Invoke-RepairCopilot -Value Mock-ReviewCopilot -Scope Global
 function Run-Review([string] $Name, [string] $Phase, [string] $InputDirectory = "$root\input", [string] $Focus = 'none') {
@@ -214,70 +284,70 @@ try {
     Assert (@($normalNames).Count -eq 10 -and
         (@($normalNames | Sort-Object) -join ',') -ceq (@($global:ReviewMock.agentCalls[-1].names | Sort-Object) -join ',')) 'Every ranked batch names its exact output repository set independently of nested context'
     $extraDependency = New-Assessment $hermes.dependency
-    Assert-Throws { ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @((New-Assessment $hermes), $extraDependency) } | ConvertTo-Json -Depth 12) @($hermes) } '*exact requested repository set*'
+    Assert-Throws { ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @((New-Assessment $hermes), $extraDependency) } | ConvertTo-Json -Depth 12) @($hermes) } '*exact requested repository set*'
     $markdown = Get-Content "$($focusReview.output)\copilot-review.md" -Raw
     Assert ($markdown -like '*sindresorhus/get-windows*' -and $markdown -like '*window enumeration*' -and $markdown -like '*native Windows Arm64*') 'Final readable evidence explains the dependency instead of reporting a false empty success'
 
     foreach ($case in 'active_native_fix', 'merged_native_fix', 'unknown') {
         $answer = New-Assessment $hermes
         $answer.upstreamDisposition = $case
-        $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+        $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
         Assert (-not $result[0].eligible) "Incomplete or existing native fixes cannot become a duplicate recommendation: $case"
     }
     $answer = New-Assessment $hermes
     $answer.scope = 'project'; $answer.dependency = $null
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'project_already_advertises_native_distribution') 'Already-native project distribution cannot be recommended as a new project port'
     $hermes.nativeSupport = 'not_a_native_port_candidate'
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'platform_independent_project_distribution') 'Portable distributions are not mistaken for projects needing a native port'
     $hermes.nativeSupport = 'native_distribution_available'
     $hermes.dependency.nativeSupport = 'native_distribution_available'
     $answer = New-Assessment $hermes
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'dependency_already_advertises_native_distribution') 'A stale application comment cannot hide an already-published native dependency'
     $hermes.dependency.nativeSupport = 'unverified'
     $hermes.dependency.coverage.pullRequestsTruncated = $true
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'upstream_work_not_fully_assessed') 'Incomplete dependency PR evidence also prevents duplicate recommendations'
     $hermes.dependency.coverage.pullRequestsTruncated = $false
     $hermes.coverage.pullRequestsTruncated = $true
     $answer = New-Assessment $hermes
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert (-not $result[0].eligible -and $result[0].eligibilityReason -eq 'upstream_work_not_fully_assessed') 'A reported dependency gap with truncated upstream evidence remains a follow-up, not an automatic repair'
     $hermes.coverage.pullRequestsTruncated = $false
     $answer = New-Assessment $hermes
     $answer.citations[0].quote = 'A model-generated paraphrase must never replace the actual source.'
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].citations[0].quote -ceq $global:ReviewMock.stageText) 'Only the selected original passage, never model-generated quote text, enters the report'
     $answer = New-Assessment $hermes
     $answer.citations = @($answer.citations[0])
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].assessment -eq 'reported_missing_native_support' -and $result[0].evidenceStatus -eq 'uncorroborated_report' -and
         -not $result[0].eligible -and $result[0].reviewWarning) 'A genuine one-source report is retained as explicitly unconfirmed without aborting unrelated reviews'
     $answer = New-Assessment $hermes
     $answer.citations = @($answer.citations[1])
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].assessment -eq 'unknown' -and $result[0].evidenceStatus -eq 'no_explicit_gap_citation' -and
         -not $result[0].eligible -and $result[0].modelAssessment -eq 'reported_missing_native_support' -and
         $result[0].reviewWarning) 'A model-labelled gap without an explicit source statement is visibly rejected, not silently promoted'
     $answer = New-Assessment $hermes
     $answer.scope = 'feature'
     $answer.dependency.name = 'get-windows window enumeration'
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].dependency.name -ceq 'get-windows window enumeration' -and
         $result[0].dependency.repository -ceq 'sindresorhus/get-windows' -and $result[0].eligible) 'A bounded component display name is not incorrectly rejected as a package-manager identifier'
     $source = $hermes.documents | Where-Object { $_.id -like '*stage-native-deps.mjs' } | Select-Object -First 1
     $originalContent = $source.content
     $source.content = Get-RepositoryExcerpt "Four independent reviews: no blockers.`nWindows ARM64 runtime verification (archive verified; runtime tested on x64)."
-    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @((New-Assessment $hermes)) } | ConvertTo-Json -Depth 12) @($hermes))
+    $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @((New-Assessment $hermes)) } | ConvertTo-Json -Depth 12) @($hermes))
     Assert ($result[0].assessment -eq 'unknown' -and $result[0].evidenceStatus -eq 'no_explicit_gap_citation' -and
         -not $result[0].eligible) 'An unrelated no-blockers sentence cannot turn an unverified ARM64 runtime checklist into a missing-support recommendation'
     $source.content = $originalContent
     foreach ($case in 'passage', 'passage-type', 'foreign-source', 'owner', 'missing-surface', 'duplicate', 'wrong-repository', 'missing-repository',
         'blank-dependency', 'long-dependency', 'control-dependency', 'wrong-dependency-type') {
         $answer = New-Assessment $hermes
-        $payload = @{ schemaVersion = 2; repositories = @($answer) }
+        $payload = @{ schemaVersion = 3; repositories = @($answer) }
         switch ($case) {
             'passage' { $answer.citations[0].passage = 9999 }
             'passage-type' { $answer.citations[0].passage = '1' }
@@ -296,6 +366,157 @@ try {
     }
     Assert-Throws { ConvertFrom-DiscoveryReview 'not JSON' @($hermes) } '*valid review JSON*'
     Assert-Throws { Get-DiscoveryReviewPrompt (@($hermes) * 11) } '*ten repositories*'
+    foreach ($kind in 'unknown', 'not_applicable', 'source_gap', 'upstream_prerequisite', 'maintainer_policy') {
+        $answer = New-Assessment $hermes
+        $answer.blockerKind = $kind; $answer.blockerCitation = $null
+        $result = Read-Assessment $answer $hermes
+        Assert (-not $result.eligible -and $result.eligibilityReason -eq 'missing_support_reason_not_established') "Uncited $kind cannot establish an underlying cause or maintainer decision"
+    }
+
+    Reset-Mock
+    $azahar = New-AzaharReview
+    $pr = $azahar.documents | Where-Object kind -eq 'pull_request'
+    $closing = $azahar.documents | Where-Object id -like '*4735193886'
+    Assert ($global:ReviewMock.calls.Count -eq 1 -and $azahar.coverage.discussionEvidenceComplete -and
+        $pr.details.closedBy -ceq 'OpenSauce04' -and $pr.details.author -ceq 'talynone' -and
+        $pr.details.closureHistory[0].__typename -eq 'ReopenedEvent' -and
+        $closing.details.authorAssociation -eq 'MEMBER' -and $closing.content.text -like '*MXE*') 'The real closing explanation and final actor survive the earlier reopened bot closure without additional HTTP reads'
+    $promptRepository = Get-ReviewPromptRepository $azahar
+    $prompt = Get-DiscoveryReviewPrompt @($azahar)
+    Assert ($promptRepository.closedPullRequestIds -contains 'azahar-emu/azahar/pr-2062' -and
+        $prompt -like '*Closed/unmerged does NOT mean available work*' -and
+        $prompt -like '*OpenSauce04*' -and $prompt -like '*MXE*' -and $prompt -like '*upstream_prerequisite*') 'Copilot receives explicit closed PR identities, authority and the actual cause, not only a better instruction'
+    $answer = New-GapAssessment $azahar
+    $result = Read-Assessment $answer $azahar
+    Assert ($result.evidenceStatus -eq 'corroborated_report' -and $result.assessment -eq 'reported_missing_native_support' -and
+        $result.rootCauseEvidenceStatus -eq 'cited' -and $result.closedPrReviewStatus -eq 'maintainer_deferred' -and
+        -not $result.eligible -and $result.eligibilityReason -eq 'maintainer_or_prerequisite_blocks_repair' -and
+        $result.blockerCitation.quote -ceq $closing.content.text) 'Azahar remains a visible native distribution gap but its cited MXE deferral cannot become automatic repair work'
+    foreach ($case in 'author_withdrew', 'none', 'unknown') {
+        $answer = New-GapAssessment $azahar
+        $answer.blockerKind = 'source_gap'; $answer.closedPrDisposition = $case
+        $result = Read-Assessment $answer $azahar
+        Assert (-not $result.eligible -and $result.closedPrReviewStatus -eq 'unresolved') "A maintainer closure cannot be treated as available work by labelling it $case"
+    }
+    $answer = New-GapAssessment $azahar
+    $answer.blockerCitation = $null
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.closedPrReviewStatus -eq 'unresolved' -and
+        $result.rootCauseEvidenceStatus -eq 'unknown' -and $result.reviewWarning) 'An uncited closure and cause remain explicit unknown evidence'
+    $answer = New-GapAssessment $azahar
+    $answer.blockerCitation.sourceId = 'azahar-emu/azahar/pr-2062-issuecomment-1'
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.closedPrReviewStatus -eq 'unresolved') 'The earlier bot comment does not establish the final maintainer decision'
+    $closing.details.author = 'talynone'; $closing.details.authorAssociation = 'CONTRIBUTOR'
+    $closing.content = Get-RepositoryExcerpt 'I am withdrawing this Windows ARM64 patch because I lack time to finish the missing compiler configuration.'
+    $pr.details.closedBy = 'talynone'
+    $answer = New-GapAssessment $azahar
+    $answer.blockerKind = 'source_gap'; $answer.closedPrDisposition = 'author_withdrew'
+    $result = Read-Assessment $answer $azahar
+    Assert ($result.eligible -and $result.closedPrReviewStatus -eq 'author_withdrew') 'An author-closed voluntary withdrawal with cited actionable cause and corroboration can remain provisional work'
+    foreach ($case in 'unknown', 'mixed', 'superseded', 'maintainer_deferred', 'maintainer_declined') {
+        $answer.closedPrDisposition = $case
+        $result = Read-Assessment $answer $azahar
+        Assert (-not $result.eligible) "Closed PR disposition $case cannot authorize repair"
+    }
+    $answer.closedPrDisposition = 'author_withdrew'
+    $closing.details.parentId = 'azahar-emu/azahar/pr-99'
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.closedPrReviewStatus -eq 'unresolved') 'A discussion from another PR cannot explain this closure'
+    $closing.details.parentId = $pr.id
+    $otherPr = New-ReviewDocument $azahar.fullName 'pr-99' 'pull_request' 'https://github.com/azahar-emu/azahar/pull/99' 'Another closed proposal' `
+        -Details @{ state = 'CLOSED'; author = 'talynone'; closedBy = 'talynone' }
+    $azahar.documents += $otherPr
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.closedPrReviewStatus -eq 'unresolved') 'Each closed PR requires its own cited explanation; one withdrawal does not cover all closures'
+    $azahar.documents = @($azahar.documents | Where-Object id -ne $otherPr.id)
+    $azahar.dependency = $hermes.dependency
+    $azahar.dependency.coverage.discussionEvidenceComplete = $false
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.eligibilityReason -eq 'discussion_evidence_incomplete') 'Incomplete dependency discussion also blocks automatic repair'
+    $azahar.dependency = $null
+    $azahar.coverage.discussionEvidenceComplete = $false
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.eligibilityReason -eq 'discussion_evidence_incomplete') 'Incomplete root discussion blocks otherwise actionable repair'
+    $azahar.coverage.discussionEvidenceComplete = $true
+    $answer.blockerCitation = $null
+    $result = Read-Assessment $answer $azahar
+    Assert (-not $result.eligible -and $result.rootCauseEvidenceStatus -eq 'unknown') 'Actionable-looking classifications do not substitute for a cited cause'
+    foreach ($case in 'source', 'zero', 'range', 'type') {
+        $answer = New-GapAssessment $azahar
+        switch ($case) {
+            'source' { $answer.blockerCitation.sourceId = 'foreign/repo/issue-1' }
+            'zero' { $answer.blockerCitation.passage = 0 }
+            'range' { $answer.blockerCitation.passage = 999 }
+            'type' { $answer.blockerCitation.passage = '1' }
+        }
+        Assert-Throws { Read-Assessment $answer $azahar } '*source*'
+    }
+    Assert-Throws { ConvertFrom-DiscoveryReview (@{ schemaVersion = 2; repositories = @((New-Assessment $hermes)) } | ConvertTo-Json -Depth 12) @($hermes) } '*exact requested repository set*'
+    $oldContext = Read-Json "$($prepared.output)\context.json"
+    $oldContext.evidencePolicyVersion = 1
+    Write-Json "$($prepared.output)\context.json" $oldContext
+    $failed = Run-Review 'old-policy-rejected' 'Agent' $prepared.output
+    Assert ($failed.error -and $global:ReviewMock.agentCalls.Count -eq 0) 'A prepared corpus from before discussion collection cannot invoke paid review'
+    $oldContext.evidencePolicyVersion = 2
+    Write-Json "$($prepared.output)\context.json" $oldContext
+    $boundedDocuments = $oldContext.repositories[-1].documents
+    $oldContext.repositories[-1].documents += New-ReviewDocument 'owner/repo100' 'oversized' 'source' 'https://github.com/owner/repo100' ('x' * 400001) 450000
+    Write-Json "$($prepared.output)\context.json" $oldContext
+    $failed = Run-Review 'late-oversized-batch' 'Agent' $prepared.output
+    Assert ($failed.error -like '*400,000 characters*' -and $global:ReviewMock.agentCalls.Count -eq 0) 'All expanded discussion prompts are size-checked before the first paid call, including a later oversized batch'
+    $oldContext.repositories[-1].documents = $boundedDocuments
+    Write-Json "$($prepared.output)\context.json" $oldContext
+
+    foreach ($case in 'complete', 'pages', 'text', 'inline', 'malformed', 'foreign') {
+        Reset-Mock
+        $collected = New-CollectedRepository 1
+        $collected.issues = @(@{ number = 9; title = 'Windows ARM64'; url = 'https://github.com/owner/repo1/issues/9'
+            bodyEvidence = Get-RepositoryExcerpt 'Missing Windows ARM64 compiler support.' })
+        $repository = New-ReviewRepository $collected
+        $comment = @{ url = 'https://github.com/owner/repo1/issues/9#issuecomment-10'
+            body = 'The compiler configuration needs a native ARM64 target.'
+            author = @{ login = 'maintainer' }; authorAssociation = 'MEMBER'
+            createdAt = '2026-06-17T20:44:43Z'; updatedAt = '2026-06-17T20:44:43Z' }
+        if ($case -eq 'text') { $comment.body = 'x' * 1200 }
+        if ($case -eq 'foreign') { $comment.url = 'https://github.com/foreign/repo/issues/9#issuecomment-10' }
+        $connection = New-DiscussionConnection @($comment)
+        if ($case -eq 'pages') {
+            $other = $comment.Clone(); $other.url = $comment.url -replace '-10$', '-11'
+            $third = $comment.Clone(); $third.url = $comment.url -replace '-10$', '-12'
+            $connection = New-DiscussionConnection @($comment, $other, $third) 4
+        }
+        if ($case -eq 'malformed') { $connection.totalCount = 2 }
+        $global:ReviewMock.issueComments['owner/repo1/9'] = $connection
+        if ($case -in @('malformed', 'foreign')) {
+            Assert-Throws { Add-ReviewPullRequests @($repository) @{ requests = @() } } '*discussion*'
+            continue
+        }
+        Add-ReviewPullRequests @($repository) @{ requests = @() }
+        if ($case -eq 'inline') {
+            $parent = $repository.documents | Where-Object kind -eq 'issue'
+            $review = @{ url = "$($parent.url)#pullrequestreview-22"; body = 'See inline discussion.'
+                author = @{ login = 'maintainer' }; authorAssociation = 'MEMBER'; state = 'COMMENTED'
+                submittedAt = '2026-06-17T20:44:43Z'; comments = @{ totalCount = 1 } }
+            Add-ReviewDiscussion $repository $parent (New-DiscussionConnection @($review)) 'pull_request_review' 2
+        }
+        $expectedComplete = $case -eq 'complete'
+        Assert ($repository.coverage.discussionEvidenceComplete -eq $expectedComplete -and
+            ($repository.documents | Where-Object id -eq 'owner/repo1/issue-9-issuecomment-10').details.parentId -eq 'owner/repo1/issue-9' -and
+            $global:ReviewMock.calls.Count -eq 1) "Issue identity and completeness are preserved for $case discussion without extra HTTP requests"
+    }
+    $repository = New-ReviewRepository (New-CollectedRepository 1)
+    $repository.coverage.discussionEvidenceComplete = $true
+    $parent = New-ReviewDocument $repository.fullName 'pr-1' 'pull_request' 'https://github.com/owner/repo1/pull/1' 'Budget fixture' `
+        -Details @{ discussionComplete = $true }
+    for ($i = 1; $i -le 12; $i++) {
+        $comment = @{ url = "$($parent.url)#issuecomment-$i"; body = 'x' * 1000
+            author = $null; authorAssociation = 'NONE'; createdAt = '2026-06-17T20:44:43Z'; updatedAt = '2026-06-17T20:44:43Z' }
+        Add-ReviewDiscussion $repository $parent (New-DiscussionConnection @($comment)) 'pull_request_comment' 4
+    }
+    Assert ($repository.coverage.discussionCharacters -eq 9000 -and
+        ($repository.documents.content.text.Length | Measure-Object -Sum).Sum -le 9000 -and
+        -not $repository.coverage.discussionEvidenceComplete -and -not $parent.details.discussionComplete) 'Repository discussion budget stays within 9000 characters and exposes omitted text'
 
     Reset-Mock
     $global:ReviewMock.agentFailAt = 2
