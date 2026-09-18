@@ -74,6 +74,8 @@ collection, a separate native Arm64 `review` job runs the CLI with the Actions
 `GITHUB_TOKEN` and `copilot-requests: write`. Copilot access/entitlement is required.
 It reviews up to ten repositories per call: ten calls for the normal 100-repository
 pool, at most eleven with a named focus, each limited to 180 seconds without retries.
+Replies request compact JSON and concise cause/closure explanations rather than
+repeating the source corpus; source passages remain available through citations.
 Only that job grants Copilot access; the collector has public read access and the
 reviewer never receives the fork-publishing secret. A nonblank URL still runs the
 API fork trial without AI. Neither content review nor the CLI architecture check

@@ -387,6 +387,8 @@ try {
     Assert ($promptRepository.closedPullRequestIds -contains 'azahar-emu/azahar/pr-2062' -and
         $prompt -like '*Closed/unmerged does NOT mean available work*' -and
         $prompt -like '*OpenSauce04*' -and $prompt -like '*MXE*' -and $prompt -like '*upstream_prerequisite*') 'Copilot receives explicit closed PR identities, authority and the actual cause, not only a better instruction'
+    Assert ($prompt -like '*compact JSON without indentation*' -and $prompt -like '*40-80 words*' -and
+        $prompt -like '*final closure decisions and material uncertainty*') 'Bounded concise explanations preserve cause and maintainer intent without repeating the collected evidence'
     $answer = New-GapAssessment $azahar
     $result = Read-Assessment $answer $azahar
     Assert ($result.evidenceStatus -eq 'corroborated_report' -and $result.assessment -eq 'reported_missing_native_support' -and

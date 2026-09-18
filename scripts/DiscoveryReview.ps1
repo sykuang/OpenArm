@@ -433,6 +433,11 @@ incomplete discussion or an uninspected replacement PR require human review, not
 If PR coverage is truncated, say no native fix was identified in the supplied subset,
 not that no native fix or PR exists; full upstream status remains unconfirmed.
 Return ONLY one JSON object: {"schemaVersion":3,"repositories":[...]}.
+Use compact JSON without indentation. Keep each reason to 2-4 short sentences,
+normally 40-80 words; use one sentence for straightforward existing/unknown support.
+Summarize the underlying cause, final closure decisions and material uncertainty.
+Do not restate every asset, issue, PR or quotation: citations carry that evidence.
+Preserve distinctions between maintainer policy, prerequisites and actionable gaps.
 Return exactly one entry per REQUESTED_REPOSITORIES name, in any order, using this shape:
 {"fullName":"owner/repo",
  "assessment":"reported_missing_native_support|existing_native_support|existing_support_bug|emulation_only|unknown",
