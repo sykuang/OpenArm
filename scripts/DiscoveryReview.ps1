@@ -253,7 +253,7 @@ r${i}: search(query: $encoded, type: ISSUE, first: 5) {
     comments(last: 4) { $commentFields }
     reviews(last: 2) { totalCount nodes { url body state author { login } authorAssociation submittedAt comments { totalCount } } pageInfo { hasPreviousPage } }
     timelineItems(last: 2, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
-      totalCount nodes { __typename ... on ClosedEvent { createdAt actor { login } } ... on ReopenedEvent { createdAt actor { login } } }
+      totalCount filteredCount nodes { __typename ... on ClosedEvent { createdAt actor { login } } ... on ReopenedEvent { createdAt actor { login } } }
       pageInfo { hasPreviousPage }
     }
   } } pageInfo { hasNextPage }
@@ -298,9 +298,13 @@ r${i}: search(query: $encoded, type: ISSUE, first: 5) {
                 $pr.merged -ne ($pr.state -ceq 'MERGED') -or $pr.title -isnot [string]) { throw 'Invalid PR evidence identity or state.' }
             $seen[[string]$pr.number] = $true
             $history = $pr.timelineItems
-            if ($history.totalCount -lt 0 -or $history.nodes -isnot [array] -or
-                $history.nodes.Count -ne [Math]::Min(2, $history.totalCount) -or
-                $history.pageInfo.hasPreviousPage -ne ($history.totalCount -gt 2) -or
+            # GitHub's totalCount includes events excluded by itemTypes.
+            if (($history.filteredCount -isnot [int] -and $history.filteredCount -isnot [long]) -or
+                $history.filteredCount -lt 0 -or $history.totalCount -lt $history.filteredCount -or
+                $history.nodes -isnot [array] -or
+                $history.nodes.Count -ne [Math]::Min(2, $history.filteredCount) -or
+                $history.pageInfo.hasPreviousPage -isnot [bool] -or
+                $history.pageInfo.hasPreviousPage -ne ($history.filteredCount -gt 2) -or
                 @($history.nodes | Where-Object __typename -notin @('ClosedEvent', 'ReopenedEvent')).Count) {
                 throw 'Invalid PR closure history.'
             }
@@ -311,7 +315,8 @@ r${i}: search(query: $encoded, type: ISSUE, first: 5) {
                     author = $(if ($pr.author) { [string]$pr.author.login } else { $null })
                     closedAt = $pr.closedAt
                     closedBy = $(if ($closure.Count -eq 1 -and $closure[0].actor) { [string]$closure[0].actor.login } else { $null })
-                    closureHistory = @($history.nodes); discussionComplete = $complete }
+                    closureHistory = @($history.nodes); closureHistoryTruncated = $history.pageInfo.hasPreviousPage
+                    discussionComplete = $complete }
             if (-not $complete) { $repository.coverage.discussionEvidenceComplete = $false }
             $repository.documents += $document
             Add-ReviewDiscussion $repository $document $pr.comments 'pull_request_comment' 4

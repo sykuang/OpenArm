@@ -49,7 +49,7 @@ function Reset-Mock {
 function global:Start-Sleep { param($Seconds) }
 function New-DiscussionConnection([array] $Nodes = @(), [int] $Total = -1) {
     if ($Total -lt 0) { $Total = $Nodes.Count }
-    @{ totalCount = $Total; nodes = $Nodes; pageInfo = @{ hasPreviousPage = ($Total -gt $Nodes.Count) } }
+    @{ totalCount = $Total; filteredCount = $Total; nodes = $Nodes; pageInfo = @{ hasPreviousPage = ($Total -gt $Nodes.Count) } }
 }
 function global:Invoke-RestMethod {
     param($Uri, $Headers, $Method, $TimeoutSec, $MaximumRedirection, [switch] $SkipHttpErrorCheck, $StatusCodeVariable,
@@ -178,6 +178,7 @@ function New-AzaharReview {
             @{ __typename = 'ReopenedEvent'; createdAt = '2026-04-25T01:00:00Z'; actor = @{ login = 'talynone' } },
             @{ __typename = 'ClosedEvent'; createdAt = '2026-06-17T20:44:43Z'; actor = @{ login = 'OpenSauce04' } }) 3
     })
+    $global:ReviewMock.prNodes[$name][0].timelineItems.totalCount = 18
     $collected = New-CollectedRepository 1
     $collected.fullName = $name
     $repository = New-ReviewRepository $collected
@@ -517,6 +518,32 @@ try {
     Assert ($repository.coverage.discussionCharacters -eq 9000 -and
         ($repository.documents.content.text.Length | Measure-Object -Sum).Sum -le 9000 -and
         -not $repository.coverage.discussionEvidenceComplete -and -not $parent.details.discussionComplete) 'Repository discussion budget stays within 9000 characters and exposes omitted text'
+    foreach ($case in 'open', 'closed', 'filtered-count', 'pagination') {
+        Reset-Mock
+        $collected = New-CollectedRepository 1
+        $repository = New-ReviewRepository $collected
+        $history = New-DiscussionConnection
+        $history.totalCount = 16
+        $node = @{ number = 1; url = 'https://github.com/owner/repo1/pull/1'; title = 'Windows ARM64'
+            body = ''; state = 'OPEN'; merged = $false; closedAt = $null; author = @{ login = 'author' }
+            repository = @{ nameWithOwner = 'owner/repo1' }; comments = New-DiscussionConnection
+            reviews = New-DiscussionConnection; timelineItems = $history }
+        if ($case -eq 'closed') {
+            $node.state = 'CLOSED'; $node.closedAt = '2026-06-17T20:44:43Z'
+            $history.nodes = @(@{ __typename = 'ClosedEvent'; createdAt = $node.closedAt; actor = @{ login = 'author' } })
+            $history.filteredCount = 1
+        }
+        if ($case -eq 'filtered-count') { $history.filteredCount = 17 }
+        if ($case -eq 'pagination') { $history.pageInfo.hasPreviousPage = $true }
+        $global:ReviewMock.prNodes['owner/repo1'] = @($node)
+        if ($case -in 'filtered-count', 'pagination') {
+            Assert-Throws { Add-ReviewPullRequests @($repository) @{ requests = @() } } '*closure history*'
+        } else {
+            Add-ReviewPullRequests @($repository) @{ requests = @() }
+            Assert ($repository.coverage.discussionEvidenceComplete -and
+                @($repository.documents | Where-Object kind -eq 'pull_request').Count -eq 1) "Filtered closure history, not all $($history.totalCount) timeline events, determines completeness for $case PRs"
+        }
+    }
 
     Reset-Mock
     $global:ReviewMock.agentFailAt = 2
