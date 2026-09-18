@@ -443,7 +443,7 @@ Return exactly one entry per REQUESTED_REPOSITORIES name, in any order, using th
  "assessment":"reported_missing_native_support|existing_native_support|existing_support_bug|emulation_only|unknown",
  "scope":"project|dependency|feature",
  "dependency":null,
- "upstreamDisposition":"no_native_fix_identified|active_native_fix|merged_native_fix|workaround_only|unknown",
+ "upstreamDisposition":"no_native_fix_identified|active_native_fix|merged_native_fix|workaround_only|not_applicable|unknown",
  "blockerKind":"source_gap|native_dependency_gap|build_distribution_gap|upstream_prerequisite|maintainer_policy|unknown|not_applicable",
  "blockerCitation":null,
  "closedPrDisposition":"none|author_withdrew|maintainer_deferred|maintainer_declined|superseded|mixed|unknown",
@@ -452,6 +452,8 @@ Return exactly one entry per REQUESTED_REPOSITORIES name, in any order, using th
  "citations":[{"sourceId":"an exact supplied document id","passage":1}]}
 For a dependency use {"name":"package or component display name","repository":"owner/repo or null"}
 instead of null. The display name must be nonblank, at most 151 characters, with no control characters.
+Use upstreamDisposition=not_applicable only when native-fix work does not apply, for example
+a Markdown-only project without native code. It cannot qualify a missing-support recommendation.
 Use 0-5 citations. Select the exact integer number of a supplied passage in that document.
 blockerCitation uses the same {"sourceId":"exact supplied id","passage":1} shape, or null when
 the cause is not established/not applicable. A known cause needs a real citation, not a guess.
@@ -512,7 +514,7 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
         if ($item -isnot [hashtable] -or -not $expected.ContainsKey($item.fullName) -or $seen.ContainsKey($item.fullName) -or
             $item.assessment -cnotin @('reported_missing_native_support', 'existing_native_support', 'existing_support_bug', 'emulation_only', 'unknown') -or
             $item.scope -cnotin @('project', 'dependency', 'feature') -or
-            $item.upstreamDisposition -cnotin @('no_native_fix_identified', 'active_native_fix', 'merged_native_fix', 'workaround_only', 'unknown') -or
+            $item.upstreamDisposition -cnotin @('no_native_fix_identified', 'active_native_fix', 'merged_native_fix', 'workaround_only', 'not_applicable', 'unknown') -or
             $item.blockerKind -cnotin @('source_gap', 'native_dependency_gap', 'build_distribution_gap', 'upstream_prerequisite', 'maintainer_policy', 'unknown', 'not_applicable') -or
             -not $item.ContainsKey('blockerCitation') -or
             $item.closedPrDisposition -cnotin @('none', 'author_withdrew', 'maintainer_deferred', 'maintainer_declined', 'superseded', 'mixed', 'unknown') -or
@@ -612,7 +614,7 @@ function ConvertFrom-DiscoveryReview([string] $Text, [array] $Repositories) {
                     $item.closedPrReviewStatus -in @('maintainer_deferred', 'maintainer_declined')) { 'maintainer_or_prerequisite_blocks_repair' }
                 elseif ($item.closedPrReviewStatus -notin @('not_applicable', 'author_withdrew')) { 'closed_pull_request_requires_review' }
                 elseif ($item.rootCauseEvidenceStatus -ne 'cited') { 'missing_support_reason_not_established' }
-                elseif ($item.upstreamDisposition -eq 'unknown' -or $repository.coverage.pullRequestsTruncated -ne $false -or
+                elseif ($item.upstreamDisposition -notin @('no_native_fix_identified', 'workaround_only') -or $repository.coverage.pullRequestsTruncated -ne $false -or
                     ($repository.dependency -and $repository.dependency.coverage.pullRequestsTruncated -ne $false)) { 'upstream_work_not_fully_assessed' }
                 elseif ($repository.coverage.discussionEvidenceComplete -ne $true -or
                     ($repository.dependency -and $repository.dependency.coverage.discussionEvidenceComplete -ne $true)) { 'discussion_evidence_incomplete' }

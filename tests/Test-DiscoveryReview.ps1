@@ -289,12 +289,17 @@ try {
     $markdown = Get-Content "$($focusReview.output)\copilot-review.md" -Raw
     Assert ($markdown -like '*sindresorhus/get-windows*' -and $markdown -like '*window enumeration*' -and $markdown -like '*native Windows Arm64*') 'Final readable evidence explains the dependency instead of reporting a false empty success'
 
-    foreach ($case in 'active_native_fix', 'merged_native_fix', 'unknown') {
+    foreach ($case in 'active_native_fix', 'merged_native_fix', 'not_applicable', 'unknown') {
         $answer = New-Assessment $hermes
         $answer.upstreamDisposition = $case
         $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))
         Assert (-not $result[0].eligible) "Incomplete or existing native fixes cannot become a duplicate recommendation: $case"
     }
+    $answer = New-Assessment $hermes
+    $answer.assessment = 'unknown'; $answer.citations = @(); $answer.blockerCitation = $null
+    $answer.blockerKind = 'not_applicable'; $answer.upstreamDisposition = 'not_applicable'
+    $result = Read-Assessment $answer $hermes
+    Assert (-not $result.eligible -and $result.upstreamDisposition -eq 'not_applicable') 'Non-applicable native work is explicit, not a batch-fatal schema error or a repair recommendation'
     $answer = New-Assessment $hermes
     $answer.scope = 'project'; $answer.dependency = $null
     $result = @(ConvertFrom-DiscoveryReview (@{ schemaVersion = 3; repositories = @($answer) } | ConvertTo-Json -Depth 12) @($hermes))

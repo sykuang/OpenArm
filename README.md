@@ -147,6 +147,8 @@ README, release or source evidence. An empty search or absent asset alone is not
 enough. Findings distinguish project distribution, dependency and feature gaps
 from existing-support bugs, emulation and unknown support. The final report keeps
 at most one eligible candidate per source track; all assessments remain visible.
+For projects without applicable native work, `upstreamDisposition: not_applicable`
+is accepted explicitly but never qualifies a missing-support recommendation.
 Copilot selects numbered passages rather than generating quote text. The validator
 supplies each document's passage count and rejects out-of-range references; unknown
 assessments are prompted to omit citations rather than guess a source location. It
