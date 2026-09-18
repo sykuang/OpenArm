@@ -81,6 +81,9 @@ size, placing the largest into the least-loaded batch with room. Each call still
 contains at most ten repositories; all evidence and original source rankings are
 preserved. This avoids concentrating discussion-heavy projects into one final call
 without adding calls, raising time limits or retrying failed requests.
+Evidence-request failures retain a bounded, credential-redacted API message and
+allowlisted rate-limit/reset/retry headers to distinguish quota exhaustion from
+access denial. They never retry automatically or switch credentials.
 Only that job grants Copilot access; the collector has public read access and the
 reviewer never receives the fork-publishing secret. A nonblank URL still runs the
 API fork trial without AI. Neither content review nor the CLI architecture check

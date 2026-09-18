@@ -47,8 +47,10 @@ function Invoke-ReviewApi([string] $Uri, [hashtable] $State, [string] $Query = '
     $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'
         'User-Agent' = 'OpenArm-Discovery-Review'; Authorization = "Bearer $token" }
     $status = 0
+    $responseHeaders = @{}
     $arguments = @{ Uri = $Uri; Headers = $headers; Method = $entry.method; TimeoutSec = 30
-        MaximumRedirection = 0; SkipHttpErrorCheck = $true; StatusCodeVariable = 'status'; ErrorAction = 'Stop' }
+        MaximumRedirection = 0; SkipHttpErrorCheck = $true; StatusCodeVariable = 'status'
+        ResponseHeadersVariable = 'responseHeaders'; ErrorAction = 'Stop' }
     if ($Query) {
         $arguments.ContentType = 'application/json'
         $arguments.Body = @{ query = $Query; operationName = 'OpenArmDiscoveryReview' } | ConvertTo-Json -Compress
@@ -56,8 +58,26 @@ function Invoke-ReviewApi([string] $Uri, [hashtable] $State, [string] $Query = '
     try { $response = Invoke-RestMethod @arguments }
     catch { throw 'Public review evidence transport failed; no request was retried.' }
     $entry.httpStatus = $status
+    $entry.rateLimitHeaders = @{}
+    foreach ($header in $responseHeaders.GetEnumerator()) {
+        if ($header.Key -in @('x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after')) {
+            $value = (@($header.Value) -join ',') -replace '[\p{Cc}\p{Cf}]', ' '
+            $entry.rateLimitHeaders[$header.Key.ToLowerInvariant()] = $value.Substring(0, [Math]::Min(128, $value.Length))
+        }
+    }
     if ($AllowNotFound -and $status -eq 404) { return $null }
-    if ($status -ne 200 -or $null -eq $response) { throw "Public review evidence failed (HTTP $status); no request was retried." }
+    if ($status -ne 200 -or $null -eq $response) {
+        $message = ''
+        if ($response -and $response.PSObject.Properties['message'] -and $response.message -is [string]) {
+            $message = $response.message -replace '[\p{Cc}\p{Cf}]', ' '
+            foreach ($secret in @($token, $env:GITHUB_TOKEN)) {
+                if ($secret) { $message = $message.Replace($secret, '[redacted]') }
+            }
+            $message = $message.Substring(0, [Math]::Min(512, $message.Length))
+        }
+        $entry.apiMessage = $message
+        throw "Public review evidence failed (HTTP $status); no request was retried. API message: $message"
+    }
     $response
 }
 

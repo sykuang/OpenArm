@@ -37,6 +37,7 @@ function Reset-Mock {
     $global:ReviewMock = @{
         calls = @(); agentCalls = @(); failAt = 0; agentFailAt = 0; fileError = ''; prError = ''
         prNodes = @{}; issueComments = @{}
+        responseHeaders = @{}
         stageText = 'The get-windows package has no Windows ARM64 prebuilt; preserve the desktop build and disable window enumeration.'
         dependencyAsset = 'napi-9-win32-unknown-x64.tar.gz'
     }
@@ -52,7 +53,7 @@ function New-DiscussionConnection([array] $Nodes = @(), [int] $Total = -1) {
     @{ totalCount = $Total; filteredCount = $Total; nodes = $Nodes; pageInfo = @{ hasPreviousPage = ($Total -gt $Nodes.Count) } }
 }
 function global:Invoke-RestMethod {
-    param($Uri, $Headers, $Method, $TimeoutSec, $MaximumRedirection, [switch] $SkipHttpErrorCheck, $StatusCodeVariable,
+    param($Uri, $Headers, $Method, $TimeoutSec, $MaximumRedirection, [switch] $SkipHttpErrorCheck, $StatusCodeVariable, $ResponseHeadersVariable,
         $ErrorAction, $ContentType, $Body)
     $m = $global:ReviewMock
     if (([uri]$Uri).Host -cne 'api.github.com' -or $TimeoutSec -ne 30 -or $MaximumRedirection -ne 0 -or
@@ -60,7 +61,8 @@ function global:Invoke-RestMethod {
     $m.calls += @{ uri = $Uri; method = $Method }
     $status = if ($m.calls.Count -eq $m.failAt) { 429 } else { 200 }
     Set-Variable -Name $StatusCodeVariable -Value $status -Scope 1
-    if ($status -ne 200) { return [pscustomobject]@{ message = 'offline-discovery-value' } }
+    Set-Variable -Name $ResponseHeadersVariable -Value $m.responseHeaders -Scope 1
+    if ($status -ne 200) { return [pscustomobject]@{ message = 'API rate limit exceeded. offline-discovery-value' } }
     $url = [uri]$Uri
     if ($Method -ceq 'POST') {
         $payload = $Body | ConvertFrom-Json
@@ -606,9 +608,20 @@ try {
     }
     Reset-Mock
     $global:ReviewMock.failAt = 2
+    $global:ReviewMock.responseHeaders = [Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::Ordinal)
+    $global:ReviewMock.responseHeaders.Add('X-RateLimit-Remaining', @('0'))
+    $global:ReviewMock.responseHeaders.Add('x-ratelimit-reset', @('1800266400'))
+    $global:ReviewMock.responseHeaders.Add('Retry-After', @('60'))
+    $global:ReviewMock.responseHeaders.Add('Authorization', @('never-record-this-header'))
     $failed = Run-Review 'http-failure' 'Prepare'
     Assert ($failed.error -like '*HTTP 429*' -and $failed.report.assessedCount -eq 1 -and
         $global:ReviewMock.calls.Count -eq 2 -and $failed.report.recommendations.Count -eq 0) 'HTTP failures preserve progress without authentication fallback or retries'
+    $request = $failed.report.requests[-1]
+    Assert ($request.rateLimitHeaders['x-ratelimit-remaining'] -eq '0' -and
+        $request.rateLimitHeaders['x-ratelimit-reset'] -eq '1800266400' -and
+        $request.rateLimitHeaders['retry-after'] -eq '60' -and $request.rateLimitHeaders.Count -eq 3 -and
+        $request.apiMessage -ceq 'API rate limit exceeded. [redacted]' -and
+        (Get-Content "$($failed.output)\report.json" -Raw) -notlike '*offline-discovery-value*') 'Only safe rate-limit headers and a credential-redacted API error enter durable failure evidence'
     Reset-Mock
     $global:ReviewMock.fileError = '404'
     $document = Get-ReviewFile @{ fullName = 'owner/repo1'; defaultBranch = 'main' } @{ requests = @() }
