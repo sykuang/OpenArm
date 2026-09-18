@@ -335,24 +335,29 @@ class PipelineChecks(unittest.TestCase):
         workflow = load(ROOT / ".github" / "workflows" / "copilot-repair.yml")
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
         inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(inputs), {"repairTask", "publishDraft"})
+        self.assertEqual(set(inputs), {"repairTask", "discoveryRunId", "publishDraft", "createFork"})
         self.assertEqual(inputs["repairTask"]["default"], "hermes-browser-77488")
+        self.assertEqual(inputs["discoveryRunId"]["default"], "")
         self.assertIs(inputs["publishDraft"]["default"], False)
+        self.assertIs(inputs["createFork"]["default"], False)
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         jobs = workflow["jobs"]
-        self.assertEqual(set(jobs), {"prepare", "agent", "validate", "publish"})
-        self.assertEqual(jobs["agent"]["needs"], "prepare")
-        self.assertEqual(jobs["validate"]["needs"], "agent")
-        self.assertEqual(jobs["publish"]["needs"], "validate")
+        self.assertEqual(set(jobs), {"select", "prepare", "agent", "validate", "publish"})
+        self.assertEqual(jobs["prepare"]["needs"], "select")
+        self.assertEqual(jobs["prepare"]["if"], "${{ needs.select.outputs.status == 'ready' }}")
+        self.assertEqual(jobs["agent"]["needs"], ["select", "prepare"])
+        self.assertEqual(jobs["validate"]["needs"], ["select", "agent"])
+        self.assertEqual(jobs["publish"]["needs"], ["select", "validate"])
+        self.assertEqual(jobs["select"]["permissions"], {"contents": "read", "actions": "read"})
         self.assertEqual(jobs["agent"]["permissions"], {"contents": "read", "copilot-requests": "write"})
         self.assertEqual(jobs["validate"]["if"], "${{ needs.agent.outputs.status == 'candidate' }}")
         self.assertEqual(jobs["publish"]["if"], "${{ inputs.publishDraft && needs.validate.outputs.status == 'validated' }}")
         for name, job in jobs.items():
             self.assertNotIn("env", job)
             self.assertNotIn("continue-on-error", job)
-            self.assertEqual(job["runs-on"], "windows-latest" if name == "publish" else "windows-11-arm")
+            self.assertEqual(job["runs-on"], "windows-latest" if name in {"select", "publish"} else "windows-11-arm")
             self.assertLessEqual(job["timeout-minutes"], 45)
-            if name != "agent":
+            if name not in {"agent", "select"}:
                 self.assertNotIn("permissions", job)
             for step in job["steps"]:
                 if "uses" in step:
@@ -360,8 +365,13 @@ class PipelineChecks(unittest.TestCase):
                 if step.get("uses", "").startswith("actions/checkout@"):
                     self.assertIs(step["with"]["persist-credentials"], False)
                 if step.get("uses", "").startswith("actions/download-artifact@"):
-                    self.assertIn("${{ github.run_id }}-${{ github.run_attempt }}", step["with"]["name"])
-                    self.assertNotIn("run-id", step["with"])
+                    if name == "select":
+                        self.assertEqual(step["with"]["run-id"], "${{ inputs.discoveryRunId }}")
+                        self.assertEqual(step["with"]["github-token"], "${{ github.token }}")
+                        self.assertEqual(step["with"]["name"], "discovery-copilot-review-${{ inputs.discoveryRunId }}-${{ steps.discovery.outputs.attempt }}")
+                    else:
+                        self.assertIn("${{ github.run_id }}-${{ github.run_attempt }}", step["with"]["name"])
+                        self.assertNotIn("run-id", step["with"])
                 if step.get("uses", "").startswith("actions/upload-artifact@"):
                     self.assertEqual(step["if"], "${{ always() }}")
                     self.assertEqual(step["with"]["retention-days"], 7)
@@ -377,9 +387,56 @@ class PipelineChecks(unittest.TestCase):
                     self.assertNotIn("secrets.", str(step))
                 elif "run" in step:
                     self.assertEqual(env["OPENARM_GITHUB_TOKEN"], "${{ secrets.OPENARM_GITHUB_TOKEN }}")
+                    self.assertEqual(env["OPENARM_CREATE_FORK"], "${{ inputs.createFork }}")
                     self.assertIn("Publish-GitHubRepair.ps1", step["run"])
+                if name != "select" and "OPENARM_REPAIR_TASK" in env:
+                    self.assertEqual(env["OPENARM_REPAIR_TASK"], "${{ needs.select.outputs.taskId }}")
         self.assertNotIn("Invoke-NativeLoop", str(jobs["agent"]))
         self.assertNotIn("copilot -p", str(jobs["publish"]))
+
+    def test_discovery_handoff_checks_actual_run_provenance(self):
+        workflow = load(ROOT / ".github" / "workflows" / "copilot-repair.yml")
+        step = next(item for item in workflow["jobs"]["select"]["steps"] if item.get("id") == "discovery")
+        self.assertEqual(step["with"]["retries"], 0)
+        harness = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const script = JSON.parse(fs.readFileSync(0, 'utf8')).script;
+const valid = { repository: {id: 1}, head_repository: {id: 1}, head_branch: 'main',
+  event: 'workflow_dispatch', status: 'completed', conclusion: 'success',
+  path: '.github/workflows/github-trial.yml', head_sha: 'a'.repeat(40), run_attempt: 2 };
+const cases = [{name: 'valid', change: {}, id: '123', ok: true},
+  ...[{repository: {id: 2}}, {head_repository: {id: 2}}, {head_branch: 'untrusted'},
+      {event: 'pull_request'}, {status: 'in_progress'}, {conclusion: 'failure'},
+      {path: '.github/workflows/other.yml'}, {head_sha: 'bad'}, {run_attempt: 0}
+  ].map((change, i) => ({name: `invalid-${i}`, change, id: '123', ok: false})),
+  {name: 'unsafe-id', change: {}, id: '9007199254740992', ok: false},
+  {name: 'injected-id', change: {}, id: '123;run-code', ok: false}];
+(async () => {
+  for (const test of cases) {
+    const outputs = {}; let failed = false; let calls = 0;
+    const sandbox = { process: {env: {OPENARM_DISCOVERY_RUN: test.id}},
+      context: {repo: {owner: 'tester', repo: 'OpenArm'}},
+      core: {setOutput: (key, value) => { outputs[key] = value; }},
+      github: {rest: {
+        repos: {get: async ({owner, repo}) => {
+          if (owner !== 'tester' || repo !== 'OpenArm') throw new Error('foreign repository');
+          calls++; return {data: {id: 1, default_branch: 'main'}}; }},
+        actions: {getWorkflowRun: async ({run_id}) => {
+          if (run_id !== 123) throw new Error('wrong run');
+          calls++; return {data: {...valid, ...test.change}}; }}
+      }}};
+    try { await vm.runInNewContext(`(async () => {${script}\n})()`, sandbox); } catch { failed = true; }
+    if (failed === test.ok || (test.ok && (outputs.commit !== valid.head_sha || outputs.attempt !== '2' || calls !== 2)) ||
+        (!test.ok && Object.keys(outputs).length)) throw new Error(`provenance test failed: ${test.name}`);
+  }
+  console.log(`${cases.length} discovery run provenance checks passed.`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(["node", "-e", harness], input=json.dumps({"script": step["with"]["script"]}),
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("12 discovery run provenance checks passed.", result.stdout)
 
     def test_repair_tasks_do_not_invent_a_hermes_fix(self):
         tasks = ROOT / "targets" / "github"

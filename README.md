@@ -344,8 +344,10 @@ genuine Arm64 runtime/core-workflow evidence are required before a repair draft.
 
 Discovery never clones or executes target code, forks a repository, creates a PR
 or generates an unreviewed native target configuration. A blank URL with
-`createForkPullRequest: true` is rejected. A real source repair uses a separately
-reviewed task in the [Copilot repair workflow](#run-copilot-diagnosis-and-reviewed-repairs).
+`createForkPullRequest: true` is rejected. Pass the completed discovery run ID to
+the [Copilot repair workflow](#run-copilot-diagnosis-and-reviewed-repairs) to
+automatically select its candidate and match a reviewed native repair task;
+you do not need to assign a source repository.
 The URL-based documentation-only trial below is not an Arm64 implementation.
 
 Local metadata-only collection: `.\scripts\Find-Arm64Candidate.ps1`.
@@ -428,6 +430,33 @@ Publish `.github\workflows\copilot-repair.yml`, its scripts and the reviewed
 Copilot diagnosis and reviewed repair > Run workflow**. The original discovery
 and documentation-only fork trial remains unchanged.
 
+**Automatic candidate handoff:** set `discoveryRunId` to a successful discovery
+run in this repository. No source URL or `repairTask` assignment is needed;
+`repairTask` is ignored when a discovery run is supplied. The read-only selection
+job verifies that the source is a successful manual discovery run from this
+repository's default branch, downloads that attempt's review, and checks its run,
+commit, completion, authentication and recommendation eligibility. It reuses
+the actual review instead of paying to rescan the same 100 repositories.
+It selects the eligible Trending recommendation first, otherwise Foundational.
+For a dependency gap it selects the identified dependency owner, not the parent.
+No recommendation means no fallback target.
+
+The selected repository and cited issue must match exactly one tracked external
+native repair task. Missing/ambiguous adapters or unknown dependency ownership
+produce **`needs_human`** in `repair-selection-*`, with the exact native
+build/tests/install/core-workflow gap; all execution and publication jobs are
+skipped. Selection does not invent executable build instructions from AI text,
+repurpose an unrelated diagnosis-only task, or create a documentation PR.
+The current tracked tasks contain no external native repair adapter, so a
+discovered project such as Azahar is selected automatically but remains blocked
+until that project's native validation recipe and scope are reviewed.
+
+Enable **`publishDraft`** and **`createFork`** to allow the isolated publisher to
+create the reviewed destination fork if absent, then publish the independently
+validated source change as a draft **inside that fork**. Both default to false.
+These flags do not bypass missing adapters, baseline reproduction or native
+validation; they do not grant token access to new repositories.
+
 The **agent job alone** grants `contents: read` and `copilot-requests: write`,
 then passes the built-in `GITHUB_TOKEN` only to the Copilot step. No additional
 Copilot PAT is normally needed. The repository owner's Copilot entitlement,
@@ -492,10 +521,13 @@ The jobs deliberately separate capabilities:
   configured native validation. AI success alone never authorizes publication.
 - **Publish:** only after independent validation and `publishDraft: true`, use
   `OPENARM_GITHUB_TOKEN` in a separate API-only job. The exact candidate is bound
-  to the task, workflow commit and run. The existing fork must match the source
+  to the task, workflow commit and run. The fork must match the source
   network, have no active Actions workflows, and have its default branch still
-  at the pinned base. No fork creation, sync, reset, force push, upstream PR or
-  merge occurs. A rerun refuses an existing repair branch; ambiguous writes are
+  at the pinned base. With `createFork: true`, a missing fork is created only for
+  the reviewed owner/name after checking the source default branch still matches
+  the validated pin. Creation is sent once; bounded read-only polling waits for
+  its Git objects. No sync, reset, force push, upstream PR or merge occurs.
+  A rerun refuses an existing repair branch; ambiguous writes are
   journaled and never retried automatically.
 
 For publishing, use the fine-grained fork-only token described below (Contents
@@ -507,7 +539,7 @@ before trusting or merging it. The publisher does not audit third-party webhooks
 or grant additional permissions. Protect workflow/manifest changes with your
 normal repository review controls.
 
-Download `repair-prepared-*`, `repair-agent-*`, `repair-validated-*` and, when
+Download `repair-selection-*`, `repair-prepared-*`, `repair-agent-*`, `repair-validated-*` and, when
 applicable, `repair-published-*` artifacts for `report.json`, `auth.log`,
 `copilot.log`, candidate content and native logs/mutation receipts. They are
 run-and-attempt scoped and retained for seven days, including failures. A

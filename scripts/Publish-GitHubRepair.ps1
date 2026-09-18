@@ -11,11 +11,14 @@ if (Test-Path -LiteralPath $Output) { throw 'Publisher output already exists; in
 $null = New-Item -ItemType Directory -Path $Output
 $resultPath = Join-Path $Output 'result.json'
 $token = $env:OPENARM_GITHUB_TOKEN
-$report = @{ schemaVersion = 1; status = 'checking'; requests = @(); pullRequestUrl = $null; commit = $null; error = $null }
-$forkRoute = ''
+$report = @{ schemaVersion = 1; status = 'checking'; requests = @(); pullRequestUrl = $null; commit = $null; error = $null
+    forkCreated = $false }
+$forkRoute = ''; $sourceRoute = ''
 
-function Invoke-RepairApi([string] $Method, [string] $Route, $Body = $null, [int] $Expected = 200, [switch] $AllowMissing) {
-    if ($Method -ne 'GET' -and ($Method -ne 'POST' -or $Route -notin @(
+function Invoke-RepairApi([string] $Method, [string] $Route, $Body = $null, [int] $Expected = 200,
+    [switch] $AllowMissing, [switch] $AllowNotReady) {
+    $forkCreation = $Method -eq 'POST' -and $Route -eq "$sourceRoute/forks" -and $env:OPENARM_CREATE_FORK -eq 'true'
+    if ($Method -ne 'GET' -and -not $forkCreation -and ($Method -ne 'POST' -or $Route -notin @(
         "$forkRoute/git/trees", "$forkRoute/git/commits", "$forkRoute/git/refs", "$forkRoute/pulls"))) {
         throw 'Publisher write is outside the reviewed fork-only scope.'
     }
@@ -31,7 +34,7 @@ function Invoke-RepairApi([string] $Method, [string] $Route, $Body = $null, [int
     try { $response = Invoke-RestMethod @parameters; $entry.httpStatus = $status }
     catch { throw "GitHub $Method $Route did not complete. Inspect the mutation journal before retrying; no request was automatically retried." }
     finally { Write-Json $resultPath $report }
-    if ($AllowMissing -and $status -eq 404) { return $null }
+    if (($AllowMissing -and $status -eq 404) -or ($AllowNotReady -and $status -in @(404, 409))) { return $null }
     if ($status -ne $Expected) { throw "GitHub $Method $Route returned HTTP $status. Inspect result.json before retrying." }
     $response
 }
@@ -59,14 +62,47 @@ try {
         throw 'Publishing requires the exact nonempty, independently validated native candidate from this workflow run.'
     }
     $sourceName = $task.repository.Substring('https://github.com/'.Length)
-    $source = Invoke-RepairApi GET "/repos/$sourceName"
+    $sourceRoute = "/repos/$sourceName"
+    $source = Invoke-RepairApi GET $sourceRoute
+    if ($source.full_name -ine $sourceName) { throw 'Source repository identity does not match the reviewed native task.' }
     $forkRoute = "/repos/$($task.fork)"
-    $fork = Invoke-RepairApi GET $forkRoute
+    $fork = Invoke-RepairApi GET $forkRoute -AllowMissing
+    $base = $null
+    if (-not $fork) {
+        if ($env:OPENARM_CREATE_FORK -ne 'true') { throw 'The reviewed destination fork does not exist; enable createFork to create it after native validation.' }
+        if ([string]::IsNullOrWhiteSpace($source.default_branch)) { throw 'Source default branch is missing.' }
+        $sourceRef = Invoke-RepairApi GET "$sourceRoute/git/ref/heads/$([uri]::EscapeDataString($source.default_branch))"
+        if ($sourceRef.object.sha -cne $task.commit) {
+            throw 'Source default branch moved from the reviewed pin; no fork is created. Review and repin the native task.'
+        }
+        $actor = Invoke-RepairApi GET '/user'
+        if ($actor.login -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$') { throw 'Invalid publishing account identity.' }
+        $parts = $task.fork.Split('/')
+        $body = @{ name = $parts[1]; default_branch_only = $true }
+        if ($parts[0] -ine $actor.login) {
+            $owner = Invoke-RepairApi GET "/users/$($parts[0])"
+            if ($owner.type -ne 'Organization' -or $owner.login -ine $parts[0]) {
+                throw 'The reviewed fork owner must be the publishing account or a reviewed organization.'
+            }
+            $body.organization = $parts[0]
+        }
+        $null = Invoke-RepairApi POST "$sourceRoute/forks" $body 202
+        $report.forkCreated = $true
+        for ($attempt = 0; $attempt -lt 12; $attempt++) {
+            $fork = Invoke-RepairApi GET $forkRoute -AllowMissing
+            if ($fork -and -not [string]::IsNullOrWhiteSpace($fork.default_branch)) {
+                $base = Invoke-RepairApi GET "$forkRoute/git/ref/heads/$([uri]::EscapeDataString($fork.default_branch))" -AllowNotReady
+                if ($base) { break }
+            }
+            if ($attempt -lt 11) { Start-Sleep -Seconds 5 }
+        }
+        if (-not $base) { throw 'Fork creation was accepted but the destination is not ready. Inspect the mutation journal; no creation request was retried.' }
+    }
     $networkId = if ($source.fork) { $source.source.id } else { $source.id }
     if ($source.full_name -ine $sourceName -or $fork.full_name -ine $task.fork -or -not $fork.fork -or
         $fork.source.id -ne $networkId -or $fork.archived -or $fork.disabled -or -not $fork.permissions.push -or
         [string]::IsNullOrWhiteSpace($fork.default_branch)) { throw 'Destination must be an active, writable fork in the reviewed source network.' }
-    $base = Invoke-RepairApi GET "$forkRoute/git/ref/heads/$([uri]::EscapeDataString($fork.default_branch))"
+    if (-not $base) { $base = Invoke-RepairApi GET "$forkRoute/git/ref/heads/$([uri]::EscapeDataString($fork.default_branch))" }
     if ($base.object.sha -cne $task.commit) { throw 'Fork default branch moved or differs from the pinned repair base. Review and repin; it will not be reset or synced.' }
     $workflows = Invoke-RepairApi GET "$forkRoute/actions/workflows?per_page=100"
     if ($workflows.total_count -ne @($workflows.workflows).Count -or $workflows.total_count -gt 100 -or

@@ -68,6 +68,7 @@ try {
     Invoke-Check 'release-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-ReleaseEvidence.ps1'))
     Invoke-Check 'distribution-evidence' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-DistributionEvidence.ps1'))
     Invoke-Check 'copilot-repair' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-CopilotRepair.ps1'))
+    Invoke-Check 'discovery-repair' (Get-Process -Id $PID).Path @('-NoProfile', '-File', (Join-Path $root 'tests\Test-DiscoveryRepair.ps1'))
 
     $localPython = Join-Path $root '.local\python'
     $env:PYTHONPATH = $localPython

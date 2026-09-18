@@ -4,12 +4,21 @@ name: Copilot diagnosis and reviewed repair
   workflow_dispatch:
     inputs:
       repairTask:
-        description: Reviewed task in targets/github (Hermes is diagnosis-only)
+        description: Reviewed task; ignored when discoveryRunId automatically selects a candidate
         type: string
         required: true
         default: hermes-browser-77488
+      discoveryRunId:
+        description: Successful discovery run in this repository (selects its candidate without a source URL)
+        type: string
+        required: false
+        default: ''
       publishDraft:
         description: Publish only an independently validated external CMake repair inside its reviewed fork
+        type: boolean
+        default: false
+      createFork:
+        description: Create the reviewed destination fork only after independent native validation
         type: boolean
         default: false
 
@@ -17,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: openarm-repair-${{ github.repository_id }}-${{ inputs.repairTask }}
+  group: openarm-repair-${{ github.repository_id }}-${{ inputs.discoveryRunId || inputs.repairTask }}
   cancel-in-progress: false
 
 defaults:
@@ -25,7 +34,72 @@ defaults:
     shell: pwsh
 
 jobs:
+  select:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      status: ${{ steps.select.outputs.status }}
+      taskId: ${{ steps.select.outputs.taskId }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify the successful discovery run belongs to this trusted repository
+        if: ${{ inputs.discoveryRunId != '' }}
+        id: discovery
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          OPENARM_DISCOVERY_RUN: ${{ inputs.discoveryRunId }}
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const id = process.env.OPENARM_DISCOVERY_RUN;
+            if (!/^[1-9][0-9]*$/.test(id) || !Number.isSafeInteger(Number(id))) {
+              throw new Error('Use a numeric successful discovery run ID, not a source repository URL.');
+            }
+            const { owner, repo } = context.repo;
+            const { data: repository } = await github.rest.repos.get({ owner, repo });
+            const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(id) });
+            if (run.repository.id !== repository.id || run.head_repository?.id !== repository.id ||
+                run.head_branch !== repository.default_branch || run.event !== 'workflow_dispatch' ||
+                run.status !== 'completed' || run.conclusion !== 'success' ||
+                run.path !== '.github/workflows/github-trial.yml' ||
+                !/^[a-f0-9]{40}$/.test(run.head_sha) || !Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1) {
+              throw new Error('Automatic repair requires a successful manual discovery run from this repository default branch.');
+            }
+            core.setOutput('commit', run.head_sha);
+            core.setOutput('attempt', String(run.run_attempt));
+      - name: Download only the authenticated discovery review
+        if: ${{ inputs.discoveryRunId != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: discovery-copilot-review-${{ inputs.discoveryRunId }}-${{ steps.discovery.outputs.attempt }}
+          run-id: ${{ inputs.discoveryRunId }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}\discovery
+      - name: Select the discovered candidate and its reviewed native adapter
+        id: select
+        run: .\scripts\Select-DiscoveryRepair.ps1 -InputPath "$env:RUNNER_TEMP\discovery" -Output "$env:RUNNER_TEMP\selection" -OutputRoot "$env:RUNNER_TEMP"
+        env:
+          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_DISCOVERY_RUN: ${{ inputs.discoveryRunId }}
+          OPENARM_DISCOVERY_COMMIT: ${{ steps.discovery.outputs.commit }}
+      - name: Preserve selection and explicit native-repair blockers
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repair-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\selection
+          if-no-files-found: error
+          retention-days: 7
+
   prepare:
+    needs: select
+    if: ${{ needs.select.outputs.status == 'ready' }}
     runs-on: windows-11-arm
     timeout-minutes: 30
     steps:
@@ -35,7 +109,7 @@ jobs:
       - name: Prepare reviewed evidence and reproduce the configured baseline
         run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Prepare -Output "$env:RUNNER_TEMP\prepared" -OutputRoot "$env:RUNNER_TEMP"
         env:
-          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_REPAIR_TASK: ${{ needs.select.outputs.taskId }}
       - name: Preserve preparation evidence without transferring executable source
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -51,7 +125,7 @@ jobs:
           retention-days: 7
 
   agent:
-    needs: prepare
+    needs: [select, prepare]
     runs-on: windows-11-arm
     timeout-minutes: 25
     permissions:
@@ -91,7 +165,7 @@ jobs:
         id: repair
         run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Agent -InputPath "$env:RUNNER_TEMP\prepared" -Output "$env:RUNNER_TEMP\agent" -OutputRoot "$env:RUNNER_TEMP"
         env:
-          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_REPAIR_TASK: ${{ needs.select.outputs.taskId }}
           GITHUB_TOKEN: ${{ github.token }}
       - name: Preserve AI evidence and untrusted candidate
         if: ${{ always() }}
@@ -107,7 +181,7 @@ jobs:
           retention-days: 7
 
   validate:
-    needs: agent
+    needs: [select, agent]
     if: ${{ needs.agent.outputs.status == 'candidate' }}
     runs-on: windows-11-arm
     timeout-minutes: 45
@@ -125,7 +199,7 @@ jobs:
         id: validate
         run: .\scripts\Invoke-CopilotRepair.ps1 -Phase Validate -InputPath "$env:RUNNER_TEMP\candidate" -Output "$env:RUNNER_TEMP\validated" -OutputRoot "$env:RUNNER_TEMP"
         env:
-          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_REPAIR_TASK: ${{ needs.select.outputs.taskId }}
       - name: Preserve independent native evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -142,7 +216,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: validate
+    needs: [select, validate]
     if: ${{ inputs.publishDraft && needs.validate.outputs.status == 'validated' }}
     runs-on: windows-latest
     timeout-minutes: 10
@@ -157,8 +231,9 @@ jobs:
       - name: Publish the exact validated diff as a draft PR inside the reviewed fork
         run: .\scripts\Publish-GitHubRepair.ps1 -InputPath "$env:RUNNER_TEMP\validated" -Output "$env:RUNNER_TEMP\published" -OutputRoot "$env:RUNNER_TEMP"
         env:
-          OPENARM_REPAIR_TASK: ${{ inputs.repairTask }}
+          OPENARM_REPAIR_TASK: ${{ needs.select.outputs.taskId }}
           OPENARM_PUBLISH_DRAFT: ${{ inputs.publishDraft }}
+          OPENARM_CREATE_FORK: ${{ inputs.createFork }}
           OPENARM_GITHUB_TOKEN: ${{ secrets.OPENARM_GITHUB_TOKEN }}
       - name: Preserve mutation journal including ambiguous failures
         if: ${{ always() }}

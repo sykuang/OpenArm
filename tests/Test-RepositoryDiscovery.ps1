@@ -17,7 +17,11 @@ $env:OPENARM_GITHUB_TOKEN = 'enterprise-test-placeholder'
 $env:OPENARM_GITHUB_TRIAL_CREATE = 'False'
 $checks = 0
 function Assert([bool] $Condition, [string] $Message) {
-    if (-not $Condition) { throw "FAILED: $Message" }
+    if (-not $Condition) {
+        $lastRun = Get-Variable -Name run -ValueOnly -ErrorAction SilentlyContinue
+        $detail = if ($lastRun) { " Discovery error: $($lastRun.error)" } else { '' }
+        throw "FAILED: $Message$detail"
+    }
     $script:checks++
 }
 function New-Issue([int] $RepoNumber, [string] $Title, [int] $Number = 1) {
@@ -407,7 +411,7 @@ try {
         $r = $run.report
         Assert ($r.maxRepositories -eq 100 -and $r.requestedCount -eq 100 -and $r.selectionShortfall -eq 0 -and
             @($r.repositories.fullName | Sort-Object -Unique).Count -eq 100 -and
-            $r.assessedCount -eq 100 -and $r.releaseAssessedCount -eq 100 -and $r.distributionAssessedCount -eq 100) 'The unoverridden default actually assesses 100 distinct repositories on every surface'
+            $r.assessedCount -eq 100 -and $r.releaseAssessedCount -eq 100 -and $r.distributionAssessedCount -eq 100) "The unoverridden default actually assesses 100 distinct repositories on every surface ($case): assessed=$($r.assessedCount), releases=$($r.releaseAssessedCount), distributions=$($r.distributionAssessedCount)"
         Assert (($global:DiscoveryMock.trendingLanguages -join ',') -eq ',c,c++,rust,go' -and
             $r.sources[0].pages.Count -eq 5 -and $r.sources[0].availableCount -eq 105 -and
             $r.sources[0].selectedCount -eq 100 -and $r.sources[1].selectedCount -eq 10) 'Overlapping weekly pages backfill the unique budget without fetching unnecessary languages or losing Foundational ranks'

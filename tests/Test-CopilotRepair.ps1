@@ -8,7 +8,7 @@ Copy-Item -LiteralPath "$repo\scripts\Common.ps1", "$repo\scripts\GitHubRepair.p
     "$repo\scripts\Publish-GitHubRepair.ps1" -Destination "$root\scripts"
 $saved = @{}
 foreach ($name in 'GITHUB_TOKEN', 'COPILOT_GITHUB_TOKEN', 'OPENARM_GITHUB_TOKEN', 'GITHUB_RUN_ID',
-    'GITHUB_SHA', 'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY', 'OPENARM_PUBLISH_DRAFT', 'GITHUB_STEP_SUMMARY', 'GITHUB_OUTPUT') {
+    'GITHUB_SHA', 'GITHUB_EVENT_NAME', 'GITHUB_REPOSITORY', 'OPENARM_PUBLISH_DRAFT', 'OPENARM_CREATE_FORK', 'GITHUB_STEP_SUMMARY', 'GITHUB_OUTPUT') {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 $checks = 0
@@ -43,8 +43,10 @@ function Save-Candidate($Candidate) {
 function Reset-Mock {
     $global:RepairMock = @{ calls = [Collections.Generic.List[object]]::new(); branch = $false; workflows = @()
         workflowCount = 0; base = 'a' * 40; network = 10; writable = $true; lostResponse = $false; wrongPr = $false
-        badOriginal = $false; failStatus = 0; moveBase = $false; baseReads = 0 }
+        badOriginal = $false; failStatus = 0; moveBase = $false; baseReads = 0
+        forkMissing = $false; forkPending = $false; sourceMoved = $false; forkAccepted = $false; lostForkResponse = $false; actor = 'tester' }
 }
+function global:Start-Sleep { param($Seconds) }
 function global:Invoke-RestMethod {
     param($Method, $Uri, $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection,
         $SkipHttpErrorCheck, $StatusCodeVariable)
@@ -60,13 +62,25 @@ function global:Invoke-RestMethod {
     $status = 200; $result = $null
     if ($m.failStatus) { $status = $m.failStatus; $result = @{} }
     elseif ($Method -eq 'GET' -and $route -eq '/repos/upstream/widget') {
-        $result = @{ id = 10; fork = $false; full_name = 'upstream/widget' }
+        $result = @{ id = 10; fork = $false; full_name = 'upstream/widget'; default_branch = 'main' }
     } elseif ($Method -eq 'GET' -and $route -eq $fork) {
         $result = @{ id = 20; fork = $true; full_name = 'tester/widget'; source = @{ id = $m.network }
             archived = $false; disabled = $false; permissions = @{ push = $m.writable }; default_branch = 'main' }
+        if ($m.forkMissing) { $status = 404; $result = @{} }
+    } elseif ($Method -eq 'GET' -and $route -eq '/repos/upstream/widget/git/ref/heads/main') {
+        $result = @{ object = @{ sha = $(if ($m.sourceMoved) { 'c' * 40 } else { 'a' * 40 }) } }
+    } elseif ($Method -eq 'GET' -and $route -eq '/user') {
+        $result = @{ login = $m.actor }
+    } elseif ($Method -eq 'GET' -and $route -eq '/users/tester') {
+        $result = @{ login = 'tester'; type = 'User' }
+    } elseif ($Method -eq 'POST' -and $route -eq '/repos/upstream/widget/forks') {
+        if ($m.lostForkResponse) { throw 'Lost fork response' }
+        $m.forkAccepted = $true; $m.forkMissing = $false
+        $status = 202; $result = @{}
     } elseif ($Method -eq 'GET' -and $route -eq "$fork/git/ref/heads/main") {
         $m.baseReads++
         $result = @{ object = @{ sha = $(if ($m.moveBase -and $m.baseReads -gt 1) { 'c' * 40 } else { $m.base }) } }
+        if ($m.forkPending) { $status = 409; $result = @{} }
     } elseif ($Method -eq 'GET' -and $route -eq "$fork/actions/workflows?per_page=100") {
         $result = @{ total_count = $m.workflowCount; workflows = $m.workflows }
     } elseif ($Method -eq 'GET' -and $route -eq "$fork/git/ref/heads/openarm-repair-101") {
@@ -106,6 +120,7 @@ try {
     $env:GITHUB_RUN_ID = '101'; $env:GITHUB_SHA = 'b' * 40
     $env:GITHUB_EVENT_NAME = 'workflow_dispatch'; $env:GITHUB_REPOSITORY = 'tester/OpenArm'
     $env:OPENARM_PUBLISH_DRAFT = 'true'
+    $env:OPENARM_CREATE_FORK = 'false'
     $pwsh = (Get-Process -Id $PID).Path
     $probe = 'Write-Output (@($env:GITHUB_TOKEN, $env:COPILOT_GITHUB_TOKEN, $env:OPENARM_GITHUB_TOKEN) -join "|")'
     foreach ($case in @(
@@ -176,6 +191,25 @@ try {
     Assert ($writes[3].body.draft -and $writes[3].body.base -eq 'main' -and $run.report.pullRequestUrl -eq 'https://github.com/tester/widget/pull/7') 'Draft stays in the fork'
     $again = Run-Publisher existing
     Assert ($again.error -like '*already exists*') 'Same run never overwrites a branch or duplicates a PR'
+    Reset-Mock; $global:RepairMock.forkMissing = $true
+    $run = Run-Publisher missing-fork
+    Assert ($run.error -like '*enable createFork*' -and @($global:RepairMock.calls | Where-Object method -ne 'GET').Count -eq 0) 'A missing fork is not created without separate opt-in'
+    $env:OPENARM_CREATE_FORK = 'true'
+    Reset-Mock; $global:RepairMock.forkMissing = $true
+    $run = Run-Publisher create-fork
+    $writes = @($global:RepairMock.calls | Where-Object method -ne 'GET')
+    Assert (-not $run.error -and $run.report.status -eq 'draft_created' -and $run.report.forkCreated -and
+        $writes.Count -eq 5 -and $writes[0].route -eq '/repos/upstream/widget/forks' -and
+        $writes[0].body.default_branch_only -eq $true -and $writes[0].body.name -eq 'widget') 'Opt-in creates the reviewed fork once, then publishes the exact independently validated native change'
+    foreach ($case in 'sourceMoved', 'wrong-owner', 'forkPending', 'lostForkResponse') {
+        Reset-Mock; $global:RepairMock.forkMissing = $true
+        if ($case -eq 'wrong-owner') { $global:RepairMock.actor = 'another-user' } else { $global:RepairMock[$case] = $true }
+        $run = Run-Publisher "fork-$case"
+        $writes = @($global:RepairMock.calls | Where-Object method -ne 'GET')
+        $expectedWrites = if ($case -in @('sourceMoved', 'wrong-owner')) { 0 } else { 1 }
+        Assert ($run.error -and $writes.Count -eq $expectedWrites -and -not $run.report.pullRequestUrl) "New-fork failure never retries creation or publishes a PR: $case"
+    }
+    $env:OPENARM_CREATE_FORK = 'false'
     foreach ($scenario in @(
         @{ name = 'wrong-network'; key = 'network'; value = 11; error = '*source network*' },
         @{ name = 'no-write'; key = 'writable'; value = $false; error = '*writable fork*' },
@@ -252,7 +286,7 @@ try {
     Write-Host "Passed $checks Copilot repair checks."
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-    Remove-Item Function:\Invoke-RestMethod -Force -ErrorAction SilentlyContinue
+    Remove-Item Function:\Invoke-RestMethod, Function:\Start-Sleep -Force -ErrorAction SilentlyContinue
     Remove-Variable RepairMock -Scope Global -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $root -Recurse -Force
 }
