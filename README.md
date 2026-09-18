@@ -76,6 +76,11 @@ It reviews up to ten repositories per call: ten calls for the normal 100-reposit
 pool, at most eleven with a named focus, each limited to 180 seconds without retries.
 Replies request compact JSON and concise cause/closure explanations rather than
 repeating the source corpus; source passages remain available through citations.
+The named focus runs first. Other repositories are balanced by prepared evidence
+size, placing the largest into the least-loaded batch with room. Each call still
+contains at most ten repositories; all evidence and original source rankings are
+preserved. This avoids concentrating discussion-heavy projects into one final call
+without adding calls, raising time limits or retrying failed requests.
 Only that job grants Copilot access; the collector has public read access and the
 reviewer never receives the fork-publishing secret. A nonblank URL still runs the
 API fork trial without AI. Neither content review nor the CLI architecture check

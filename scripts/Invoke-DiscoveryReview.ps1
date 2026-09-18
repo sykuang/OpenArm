@@ -35,6 +35,7 @@ $report = @{
         'Open/merged native fixes exclude duplicate recommendations; merged disabled-feature/emulation workarounds are not native fixes. Incomplete PR searches require human review.'
         'Closed/unmerged PRs do not imply available work. Maintainer deferrals/rejections, upstream prerequisites, unexplained closures and uncited underlying causes are not automatic repair recommendations.'
         'The named focus is outside the ranked pool unless independently present there; it never invents a source rank.'
+        'The named focus is reviewed first. Other repositories are assigned largest-first to the least-loaded non-full batch by prepared evidence size, without changing source ranks or omitting evidence.'
         'Copilot receives prepared public evidence over standard input with no tools, custom instructions, MCPs or target execution. There are no AI or network retries and no automatic edits, forks or PRs.'
     )
 }
@@ -174,10 +175,7 @@ try {
         $report.requestedCount = $context.repositories.Count
         $workspace = Join-Path $Output 'workspace'
         $null = New-Item -ItemType Directory -Path $workspace
-        $batches = [Collections.Generic.List[object]]::new()
-        if ($context.focusRepository) { $batches.Add(@($context.repositories | Where-Object fullName -eq $context.focusRepository)) }
-        $normal = @($context.repositories | Where-Object fullName -ne $context.focusRepository)
-        for ($i = 0; $i -lt $normal.Count; $i += 10) { $batches.Add(@($normal | Select-Object -Skip $i -First 10)) }
+        $batches = Get-DiscoveryReviewBatches $context.repositories $context.focusRepository
         if ($batches.Count -gt 11) { throw 'Copilot review exceeded eleven bounded calls.' }
         $prompts = @(foreach ($batch in $batches) {
             $question = if ($batch.fullName -contains $context.focusRepository) { $context.focusQuestion } else { '' }

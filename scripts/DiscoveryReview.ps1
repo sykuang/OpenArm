@@ -386,6 +386,32 @@ function Get-ReviewPromptRepository([hashtable] $Repository, [int] $Depth = 0) {
     $result
 }
 
+function Get-DiscoveryReviewBatches([array] $Repositories, [string] $FocusRepository = '') {
+    $batches = [Collections.Generic.List[object]]::new()
+    if ($FocusRepository) {
+        $focus = @($Repositories | Where-Object fullName -eq $FocusRepository)
+        if ($focus.Count -ne 1) { throw 'Review batching requires the exact named focus.' }
+        $batches.Add($focus)
+    }
+    $normal = @($Repositories | Where-Object fullName -ne $FocusRepository)
+    if (-not $Repositories.Count -or $normal.Count -gt 100) { throw 'Review batching requires at most 100 ranked repositories and one named focus.' }
+    $bins = @(for ($i = 0; $i -lt [Math]::Ceiling($normal.Count / 10.0); $i++) {
+        @{ index = $i; characters = 0; repositories = [Collections.Generic.List[object]]::new() }
+    })
+    $sized = @(foreach ($repository in $normal) {
+        $data = Get-ReviewPromptRepository $repository | ConvertTo-Json -Depth 30 -Compress
+        @{ repository = $repository; characters = $data.Length }
+    })
+    foreach ($entry in @($sized | Sort-Object @{ Expression = 'characters'; Descending = $true }, { $_.repository.fullName })) {
+        $bin = $bins | Where-Object { $_.repositories.Count -lt 10 } |
+            Sort-Object characters, index | Select-Object -First 1
+        $bin.repositories.Add($entry.repository)
+        $bin.characters += $entry.characters
+    }
+    foreach ($bin in $bins) { $batches.Add($bin.repositories.ToArray()) }
+    return ,$batches
+}
+
 function Get-DiscoveryReviewPrompt([array] $Repositories, [string] $Question = '') {
     if (-not $Repositories.Count -or $Repositories.Count -gt 10) { throw 'Copilot review is bounded to ten repositories per prompt.' }
     $inputRepositories = @($Repositories | ForEach-Object { Get-ReviewPromptRepository $_ })

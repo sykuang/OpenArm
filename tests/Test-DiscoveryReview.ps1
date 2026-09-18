@@ -248,6 +248,37 @@ try {
     $context = Read-Json "$($prepared.output)\context.json"
     Assert ($context.repositories.Count -eq 100 -and @($context.repositories.fullName | Sort-Object -Unique).Count -eq 100 -and
         @($context.repositories | Where-Object { $_.coverage.pullRequestMatches -ne 0 -or $_.documents.Count -ne 2 }).Count -eq 0) 'The prepared corpus covers every unique ranked repository with explicit empty-search evidence'
+    $weighted = @(foreach ($number in 1..100) {
+        $entry = New-ReviewRepository (New-CollectedRepository $number)
+        $length = if ($number -gt 90) { 16000 } else { 1000 }
+        $entry.documents += New-ReviewDocument $entry.fullName 'readme' 'readme' "https://github.com/$($entry.fullName)" ('x' * $length) 20000
+        $entry
+    })
+    $original = ConvertTo-Json -InputObject $weighted -Depth 30 -Compress
+    $balanced = Get-DiscoveryReviewBatches $weighted
+    $balancedNames = @($balanced | ForEach-Object { $_ | ForEach-Object fullName })
+    Assert ($balanced.Count -eq 10 -and @($balanced | Where-Object Count -ne 10).Count -eq 0 -and
+        @($balancedNames | Sort-Object -Unique).Count -eq 100 -and
+        (($balancedNames | Sort-Object) -join ',') -ceq (($weighted.fullName | Sort-Object) -join ',')) 'Balancing retains all 100 unique repositories in exactly ten calls of ten'
+    $largest = @($balanced | ForEach-Object { (Get-DiscoveryReviewPrompt $_).Length } | Measure-Object -Maximum).Maximum
+    $oldLargest = (Get-DiscoveryReviewPrompt @($weighted | Select-Object -Last 10)).Length
+    Assert ($largest -lt $oldLargest / 2 -and
+        @($balanced | Where-Object { @($_ | Where-Object { $_.sourceRanks.trending -gt 90 }).Count -ne 1 }).Count -eq 0) 'A heavy final source cluster is spread across all batches instead of timing out one call'
+    Assert ((ConvertTo-Json -InputObject $weighted -Depth 30 -Compress) -ceq $original) 'Balancing changes neither evidence nor source ranks'
+    $again = Get-DiscoveryReviewBatches $weighted
+    Assert ((@($again | ForEach-Object { $_.fullName -join ',' }) -join '|') -ceq
+        (@($balanced | ForEach-Object { $_.fullName -join ',' }) -join '|')) 'Equal-weight batches have deterministic tie breaking'
+    foreach ($count in 1, 9, 10, 11, 99) {
+        $subset = @($weighted | Select-Object -First $count)
+        $batches = Get-DiscoveryReviewBatches $subset
+        Assert ($batches.Count -eq [Math]::Ceiling($count / 10.0) -and
+            @($batches | Where-Object { $_.Count -lt 1 -or $_.Count -gt 10 }).Count -eq 0 -and
+            @($batches | ForEach-Object { $_.fullName }).Count -eq $count) "Partial pool $count does not invent empty calls or lose repositories"
+    }
+    $focusOnly = Get-DiscoveryReviewBatches @($weighted[0]) $weighted[0].fullName
+    Assert ($focusOnly.Count -eq 1 -and $focusOnly[0].Count -eq 1) 'A focus-only corpus produces one call without an empty normal batch'
+    Assert-Throws { Get-DiscoveryReviewBatches @() } '*at most 100*'
+    Assert-Throws { Get-DiscoveryReviewBatches $weighted 'absent/repository' } '*exact named focus*'
     $reviewed = Run-Review 'reviewed-100' 'Agent' $prepared.output
     Assert (-not $reviewed.error -and $reviewed.report.status -eq 'completed' -and $reviewed.report.assessedCount -eq 100 -and
         $reviewed.report.authVerified -and $global:ReviewMock.agentCalls.Count -eq 10) "Ten real-shaped CLI invocations review all hundred, not only heuristic candidates: $($reviewed.error)"
@@ -471,8 +502,8 @@ try {
     $boundedDocuments = $oldContext.repositories[-1].documents
     $oldContext.repositories[-1].documents += New-ReviewDocument 'owner/repo100' 'oversized' 'source' 'https://github.com/owner/repo100' ('x' * 400001) 450000
     Write-Json "$($prepared.output)\context.json" $oldContext
-    $failed = Run-Review 'late-oversized-batch' 'Agent' $prepared.output
-    Assert ($failed.error -like '*400,000 characters*' -and $global:ReviewMock.agentCalls.Count -eq 0) 'All expanded discussion prompts are size-checked before the first paid call, including a later oversized batch'
+    $failed = Run-Review 'oversized-corpus' 'Agent' $prepared.output
+    Assert ($failed.error -like '*400,000 characters*' -and $global:ReviewMock.agentCalls.Count -eq 0) 'Balancing preserves oversized evidence and rejects it before any paid call rather than silently trimming it to fit'
     $oldContext.repositories[-1].documents = $boundedDocuments
     Write-Json "$($prepared.output)\context.json" $oldContext
 
